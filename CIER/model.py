@@ -251,7 +251,7 @@ class MyModel(nn.Module):
 
 
 # =========================================================================
-# uiAdapter multimodal LoRA framework
+# MoDLoRA multimodal LoRA framework
 # =========================================================================
 class MultiModalLoraLayer(nn.Module):
     def __init__(self, base_layer, hidden_size=4096, dtype=torch.bfloat16, **kwargs):
@@ -328,7 +328,7 @@ class MultiModalLoraLayer(nn.Module):
         return self.base_layer(x) + lora_t + lora_ui + lora_img
 
 
-class uiAdapter(MyModel):
+class MoDLoRA(MyModel):
     def __init__(self, user_num, item_num, hidden, llm_hidden, tokenizer, model_llm, r=8, lora_alpha=32, lora_modules=2, image_embeddings=None, ui_multimodal_scale=1.0, image_multimodal_scale=1.0):
         super().__init__(user_num, item_num, hidden, llm_hidden, tokenizer)
         self.model = model_llm  # base LLM
