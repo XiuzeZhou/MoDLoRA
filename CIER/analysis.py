@@ -15,7 +15,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from dataloader import MyCollater, MyDataset, dataset_split
-from model import MultiModalLoraLayer, uiAdapter
+from model import MultiModalLoraLayer, MoDLoRA
 
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
@@ -158,7 +158,7 @@ def build_multimodal_image_embeddings(args, item_num, device):
     if args.image_embedding_path:
         image_embeddings = load_embedding_object(args.image_embedding_path)
         image_embeddings = remap_image_embedding_object(image_embeddings, raw_to_idx)
-        return uiAdapter.build_image_embedding_table(image_embeddings, item_num)
+        return MoDLoRA.build_image_embedding_table(image_embeddings, item_num)
 
     cache_dir = os.path.join(dataset_dir, 'embeddings_cache')
     os.makedirs(cache_dir, exist_ok=True)
@@ -168,7 +168,7 @@ def build_multimodal_image_embeddings(args, item_num, device):
         print(f"Loading cached item image embeddings from {cache_path}")
         image_embeddings = torch.load(cache_path, map_location='cpu')
         image_embeddings = remap_image_embedding_object(image_embeddings, raw_to_idx)
-        return uiAdapter.build_image_embedding_table(image_embeddings, item_num)
+        return MoDLoRA.build_image_embedding_table(image_embeddings, item_num)
 
     if args.clip_model is None:
         raise ValueError("--clip_model or --image_embedding_path is required when --use_multimodal is enabled.")
@@ -201,7 +201,7 @@ def build_multimodal_image_embeddings(args, item_num, device):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return uiAdapter.build_image_embedding_table(item_embeddings, item_num)
+    return MoDLoRA.build_image_embedding_table(item_embeddings, item_num)
 
 
 # The following modality-correlation and SVD functions are adapted from PEPLER/analysis.py
@@ -325,7 +325,7 @@ def analyze_svd_of_lora_weights(model, num_singular_values=100, lora_id=0, outpu
     r_val = lora_layer.lora_A_t.shape[0]
 
     print("\n" + "=" * 80)
-    print("Start SVD Analysis for uiAdapter-based Model")
+    print("Start SVD Analysis for MoDLoRA-based Model")
     print(f"Selected Layer: {layer_name}")
     print(f"Adapter Rank (r): {r_val}")
 
@@ -412,7 +412,7 @@ def build_model(args, tokenizer, user_num, item_num, image_embeddings, device):
     model_llm = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
     model_llm.gradient_checkpointing_enable()
 
-    model = uiAdapter(
+    model = MoDLoRA(
         user_num=user_num,
         item_num=item_num,
         hidden=args.id_hidden,
@@ -436,9 +436,9 @@ def load_adapter_state_dict(path, map_location="cpu"):
 
 
 def load_checkpoint(model, args):
-    ckpt_path = os.path.join(args.ckpt_dir, args.dataset_name, f'{args.split_index}uiadapter_model.pth')
+    ckpt_path = os.path.join(args.ckpt_dir, args.dataset_name, f'{args.split_index}modlora_model.pth')
     if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Cannot find uiAdapter checkpoint: {ckpt_path}")
+        raise FileNotFoundError(f"Cannot find MoDLoRA checkpoint: {ckpt_path}")
     state = load_adapter_state_dict(ckpt_path, map_location="cpu")
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"Loaded checkpoint: {ckpt_path}")
@@ -455,7 +455,7 @@ def resolve_cuda_index(devices):
 
 
 def parse_args():
-    parser = ArgumentParser(description='CIER uiAdapter multimodal analysis')
+    parser = ArgumentParser(description='CIER MoDLoRA multimodal analysis')
     parser.add_argument('--devices', default=-1, type=int, help='Select which GPU to use.')
     parser.add_argument('--batch_size', default=40, type=int)
     parser.add_argument('--seed', default=5254, type=int)
