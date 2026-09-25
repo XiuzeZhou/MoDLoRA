@@ -1,6 +1,11 @@
+"""Modality correlation and full-spectrum three-branch SVD for CIER MoDLoRA."""
+
+import json
 import os
 import random
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
+from contextlib import nullcontext
+from itertools import islice
 
 import matplotlib
 matplotlib.use('Agg')
@@ -8,7 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from scipy.stats import pearsonr
+import torch.nn.functional as F
 from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -33,10 +38,6 @@ def seed_everything(seed=5254):
 
 
 def infer_user_item_num(dataset_name):
-    if 'Yelp' in dataset_name:
-        return 27147, 20266
-    if 'TripAdvisor' in dataset_name:
-        return 9765, 6280
     if 'MoviesAndTV' in dataset_name:
         return 7506, 7360
     if 'ClothingShoesAndJewelry' in dataset_name:
@@ -206,211 +207,315 @@ def build_multimodal_image_embeddings(args, item_num, device):
 
 # The following modality-correlation and SVD functions are adapted from PEPLER/analysis.py
 # and translated to CIER's batch/model interfaces.
-def get_input_embeddings(model):
-    if hasattr(model.model, "get_input_embeddings"):
-        return model.model.get_input_embeddings()
-    return model.model.base_model.get_input_embeddings()
+class AnalysisCollater(MyCollater):
+    """Keep CIER's batch fields and append a mask based on true sequence lengths."""
+
+    def __call__(self, data):
+        batch = super().__call__(data)
+        input_ids, _, _, _, flags, _ = batch
+        lengths = torch.tensor([
+            min(len(row['text' if flag else 'keyword']), input_ids.size(1))
+            for row, flag in zip(data, flags.tolist())
+        ])
+        # Token ID 0 can be a real vocabulary token as well as CIER's padding ID.
+        mask = torch.arange(input_ids.size(1)).unsqueeze(0) < lengths.unsqueeze(1)
+        return (*batch, mask)
 
 
-def find_analysis_layer(model):
-    for module in model.modules():
-        if isinstance(module, MultiModalLoraLayer) and module.x_ui is not None:
-            return module
-    return None
+def pairwise_correlations(first, second):
+    """Per-sample cosine/Pearson; undefined zero-norm cases receive zero."""
+    first, second = first.float(), second.float()
+    cosine = F.cosine_similarity(first, second, dim=-1)
+    centered_first = first - first.mean(dim=-1, keepdim=True)
+    centered_second = second - second.mean(dim=-1, keepdim=True)
+    pearson = F.cosine_similarity(centered_first, centered_second, dim=-1)
+    return cosine.cpu().tolist(), pearson.cpu().tolist()
 
 
-def cosine_similarity(v1, v2):
-    v1 = v1.flatten().to(torch.float32)
-    v2 = v2.flatten().to(torch.float32)
-    return torch.nn.functional.cosine_similarity(v1, v2, dim=0).item()
+@torch.no_grad()
+def analyze_correlation(model, test_dataloader, device, num_batches=10, lora_id=0,
+                        output_dir=None, layer_id=None, module_name='q_proj'):
+    """Compare actual inputs to the selected LoRA layer, as in PEPLER.
 
+    Text is the masked mean of the layer input over the CIER prompt and review.
+    UI/image are the contexts installed by CIER's get_embedding(), without
+    adding normalization that is absent from the trained model. These input
+    correlations do not measure orthogonality of learned output subspaces.
+    Use AnalysisCollater to distinguish real token ID 0 from padding; legacy
+    six-field batches fall back to CIER's token-ID-0 padding convention.
+    """
+    if num_batches <= 0:
+        raise ValueError('num_batches must be positive.')
+    device = torch.device(device)
+    layer_name, layer = select_lora_layer(model, lora_id, layer_id, module_name)
+    if not context_branches_active(layer):
+        raise ValueError(f'{layer_name} skips UI/image branches because in_features != hidden_size. '
+                         'Choose an active layer for correlation, or use --analysis svd.')
+    pairs = [('txt_ui', 'txt', 'ui')]
+    if layer.use_image_lora:
+        pairs.extend([('txt_img', 'txt', 'img'), ('ui_img', 'ui', 'img')])
+    metrics = {pair: {'cos': [], 'pearson': []} for pair, _, _ in pairs}
+    original_modes = [(module, module.training) for module in model.modules()]
+    original_contexts = [(module, module.x_ui, module.x_img) for module in model.modules()
+                         if isinstance(module, MultiModalLoraLayer)]
+    collater = getattr(test_dataloader, 'collate_fn', None)
+    original_step = getattr(collater, 'cur_step', None)
+    captured = {}
+    attention_mask = None
 
-def pearson_correlation(v1, v2):
-    v1_np = v1.flatten().detach().cpu().to(torch.float32).numpy()
-    v2_np = v2.flatten().detach().cpu().to(torch.float32).numpy()
-    if np.std(v1_np) == 0 or np.std(v2_np) == 0:
-        return 0.0
-    corr, _ = pearsonr(v1_np, v2_np)
-    return corr if not np.isnan(corr) else 0.0
+    def capture_inputs(_module, inputs):
+        hidden = inputs[0].float()
+        if hidden.ndim != 3 or hidden.shape[:2] != attention_mask.shape:
+            raise ValueError('Expected layer inputs shaped (batch, sequence, hidden).')
+        mask = attention_mask.to(device=hidden.device, dtype=hidden.dtype).unsqueeze(-1)
+        captured['txt'] = ((hidden * mask).sum(1) / mask.sum(1).clamp_min(1)).cpu()
+        for key, context in [('ui', layer.x_ui)] + ([('img', layer.x_img)] if layer.use_image_lora else []):
+            if context is None or context.shape != captured['txt'].shape:
+                raise ValueError(f'{layer_name}: missing or incorrectly shaped {key} context.')
+            captured[key] = context.float().cpu()
 
-
-def add_pair_metrics(metrics, name, left, right):
-    for b_idx in range(left.size(0)):
-        metrics[name]['cos'].append(cosine_similarity(left[b_idx], right[b_idx]))
-        metrics[name]['pearson'].append(pearson_correlation(left[b_idx], right[b_idx]))
-
-
-def analyze_correlation(model, test_dataloader, device, num_batches=10):
+    hook = layer.register_forward_pre_hook(capture_inputs)
     model.eval()
-    metrics = {
-        'txt_ui': {'cos': [], 'pearson': []},
+    print(f'\nModality input correlation at {layer_name} (CIER prompt + review)')
+    try:
+        for batch in islice(test_dataloader, num_batches):
+            input_ids, user_id, item_id, _, curr_flag, rating_inputs = batch[:6]
+            review_mask = batch[6] if len(batch) > 6 else input_ids.ne(0)
+            if review_mask.shape != input_ids.shape:
+                raise ValueError('Review attention mask must have the same shape as input_ids.')
+            input_ids = input_ids.to(device)
+            amp = torch.autocast(device_type='cuda', dtype=torch.bfloat16) if device.type == 'cuda' else nullcontext()
+            with amp:
+                inputs_embeds = model.get_embedding(
+                    input_ids=input_ids, user_id=user_id.to(device), item_id=item_id.to(device),
+                    rating=rating_inputs.to(device), curr_flag=curr_flag.to(device),
+                )
+                prompt_length = inputs_embeds.size(1) - input_ids.size(1)
+                if prompt_length < 0:
+                    raise ValueError('CIER inputs_embeds must contain the prompt and review.')
+                prompt_mask = torch.ones((input_ids.size(0), prompt_length), device=device, dtype=torch.bool)
+                attention_mask = torch.cat([prompt_mask, review_mask.to(device=device, dtype=torch.bool)], dim=1)
+                captured.clear()
+                # Execute the selected layer without allocating vocabulary-sized LM logits.
+                model.model.base_model(
+                    inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+                    use_cache=False, output_hidden_states=False, output_attentions=False,
+                )
+            if not captured:
+                raise RuntimeError(f'The forward pass did not execute {layer_name}.')
+            for pair, first, second in pairs:
+                cosine, pearson = pairwise_correlations(captured[first], captured[second])
+                metrics[pair]['cos'].extend(cosine)
+                metrics[pair]['pearson'].extend(pearson)
+    finally:
+        hook.remove()
+        for module, x_ui, x_img in original_contexts:
+            module.x_ui, module.x_img = x_ui, x_img
+        for module, training in original_modes:
+            module.training = training
+        if original_step is not None:
+            collater.cur_step = original_step
+
+    if not metrics['txt_ui']['cos']:
+        raise ValueError('No samples were available for modality correlation.')
+    summary = {
+        pair: {'samples': len(values['cos']), 'mean_cosine': float(np.mean(values['cos'])),
+               'mean_pearson': float(np.mean(values['pearson']))}
+        for pair, values in metrics.items()
     }
-    if getattr(model, "use_image_lora", False):
-        metrics['txt_img'] = {'cos': [], 'pearson': []}
-        metrics['ui_img'] = {'cos': [], 'pearson': []}
-
-    print("\n" + "=" * 60)
-    print("Start Modality Analysis")
-
-    pad_id = 0
-    embeddings_layer = get_input_embeddings(model)
-
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(test_dataloader):
-            if batch_idx >= num_batches:
-                break
-
-            input_ids = batch[0].to(device)
-            user_id = batch[1].to(device)
-            item_id = batch[2].to(device)
-            curr_flag = batch[4].to(device)
-            rating_inputs = batch[5].to(device)
-
-            if torch.cuda.is_available():
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    model.get_embedding(input_ids=input_ids, user_id=user_id, item_id=item_id, rating=rating_inputs, curr_flag=curr_flag)
-            else:
-                model.get_embedding(input_ids=input_ids, user_id=user_id, item_id=item_id, rating=rating_inputs, curr_flag=curr_flag)
-
-            target_layer = find_analysis_layer(model)
-            if target_layer is None:
-                continue
-
-            token_embeddings = embeddings_layer(input_ids).to(torch.float32)
-            mask = (input_ids != pad_id).unsqueeze(-1).to(torch.float32)
-            x_txt = (token_embeddings * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-
-            batch_size = input_ids.size(0)
-            x_ui = target_layer.x_ui[:batch_size].to(torch.float32)
-            add_pair_metrics(metrics, 'txt_ui', x_txt, x_ui)
-
-            x_img = getattr(target_layer, "x_img", None)
-            if x_img is not None and 'txt_img' in metrics:
-                x_img = x_img[:batch_size].to(torch.float32)
-                add_pair_metrics(metrics, 'txt_img', x_txt, x_img)
-                add_pair_metrics(metrics, 'ui_img', x_ui, x_img)
-
-    print(f"{'Modal Pair':<15} | {'Cosine Sim':<15} | {'Pearson Corr':<15}")
-    print("-" * 50)
-    for key, val in metrics.items():
-        if val['cos']:
-            avg_cos = np.mean(val['cos'])
-            avg_pearson = np.mean(val['pearson'])
-            print(f"{key:<15} | {avg_cos:^15.4f} | {avg_pearson:^15.4f}")
-        else:
-            print(f"{key:<15} | {'N/A':^15} | {'N/A':^15}")
-    print("=" * 60)
+    print(f"{'Modal pair':<15} | {'Cosine':>12} | {'Pearson':>12} | {'Samples':>8}")
+    for pair, values in summary.items():
+        print(f"{pair:<15} | {values['mean_cosine']:12.4f} | "
+              f"{values['mean_pearson']:12.4f} | {values['samples']:8d}")
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, 'correlation_results.json')
+        with open(output_path, 'w', encoding='utf-8') as file:
+            json.dump({'layer': layer_name,
+                       'representation': 'layer inputs; text = masked mean over CIER prompt + review',
+                       'metrics': metrics, 'summary': summary}, file, indent=2)
+        print(f'Correlation results saved to: {output_path}')
     return metrics
 
 
+def select_lora_layer(model, lora_id=0, layer_id=None, module_name='q_proj'):
+    """Select by Transformer block/projection, or the legacy flattened LoRA index."""
+    layers = [(name, layer) for name, layer in model.named_modules()
+              if isinstance(layer, MultiModalLoraLayer)]
+    if not layers:
+        raise ValueError('No MultiModalLoraLayer found; use a MoDLoRA checkpoint.')
+    if layer_id is not None:
+        if layer_id < 0:
+            raise ValueError('layer_id must be nonnegative.')
+        block_path = f'.layers.{layer_id}.'
+        matches = [(name, layer) for name, layer in layers
+                   if block_path in f'.{name}' and name.rsplit('.', 1)[-1] == module_name]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f'Multiple LoRA modules match layer_id={layer_id}, module_name={module_name}: '
+                             f'{[name for name, _ in matches]}. Use --lora_id to select one explicitly.')
+        available = [name for name, _ in layers]
+        raise ValueError(f'No LoRA module matches layers.{layer_id}.*.{module_name}. '
+                         'Check the Transformer layer number and the trained lora_modules setting. '
+                         f'Available LoRA modules (first 12 of {len(available)}): {available[:12]}')
+    if not 0 <= lora_id < len(layers):
+        raise ValueError(f'lora_id must be between 0 and {len(layers) - 1}, got {lora_id}.')
+    return layers[lora_id]
+
+
+def context_branches_active(layer):
+    # This is the dimension check used by MultiModalLoraLayer._context_lora.
+    return layer.base_layer.in_features == layer.hidden_size
+
+
 def compute_delta_w(lora_A, lora_B, scaling):
-    lora_A = lora_A.to(torch.float32)
-    lora_B = lora_B.to(torch.float32)
-    return (lora_B @ lora_A) * scaling
+    """Materialize scaling * B @ A in CPU FP32 for full-spectrum analysis."""
+    a = lora_A.detach().to(device='cpu', dtype=torch.float32)
+    b = lora_B.detach().to(device='cpu', dtype=torch.float32)
+    return (b @ a) * float(scaling)
 
 
-def analyze_svd_of_lora_weights(model, num_singular_values=100, lora_id=0, output_dir='./analysis_results'):
-    model.eval()
+def plot_spectra(results, keys, output_path):
+    fig, ax = plt.subplots(figsize=(10, 6))
+    positive_values = [s for key in keys for s in results[key]['plotted_singular_values'] if s > 0]
+    has_positive_values = bool(positive_values)
+    zero_floor = min(positive_values) * 0.1 if has_positive_values else 0.0
+    zeros_clipped = False
+    marked_ranks = set()
+    for key in keys:
+        result = results[key]
+        values = np.asarray(result['plotted_singular_values'])
+        # Keep exact zeros visible on log axes; the JSON retains the raw values.
+        plotted = np.maximum(values, zero_floor) if has_positive_values else values
+        zeros_clipped |= has_positive_values and bool(np.any(values == 0))
+        label = rf"{key.capitalize()}_$\Delta$W"
+        if not np.any(values > 0):
+            label += ' [zero matrix]'
+        line, = ax.plot(np.arange(1, len(values) + 1), plotted, '.-', markersize=3, label=label)
+        rank = result['rank_upper_bound']
+        # Modalities with the same rank share one marker and one label.
+        if rank not in marked_ranks:
+            marked_ranks.add(rank)
+            rank_label = f'$r = {rank}$'
+            if key == 'fused':
+                branch_ranks = [value['rank_upper_bound'] for name, value in results.items()
+                                if name != 'fused']
+                if len(branch_ranks) > 1 and len(set(branch_ranks)) == 1 and sum(branch_ranks) == rank:
+                    rank_label = rf'$\sum r_m = {rank}$'
+                else:
+                    rank_label = rf'$r_{{\mathrm{{fused}}}} = {rank}$'
+            ax.axvline(rank, color=line.get_color(), linestyle='--', alpha=0.6)
+            ax.annotate(
+                rank_label, xy=(rank, 0.95), xycoords=ax.get_xaxis_transform(),
+                xytext=(6, 0), textcoords='offset points',
+                color=line.get_color(), fontsize=12, ha='left', va='top',
+                bbox={'facecolor': 'white', 'edgecolor': 'none', 'alpha': 0.75, 'pad': 2},
+            )
+    ax.set_xscale('log')
+    if has_positive_values:
+        ax.set_yscale('log')
+    if zeros_clipped:
+        ax.text(0.02, 0.02, f'Exact zeros displayed at {zero_floor:.1e}',
+                transform=ax.transAxes, fontsize=8)
+    ax.set_xlabel('Singular value index k')
+    ax.set_ylabel('Singular value')
+    ax.grid(True, which='both', linestyle='--', alpha=0.5)
+    ax.legend(loc='best')
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    print(f'Figure saved to: {output_path}')
+
+
+@torch.no_grad()
+def analyze_svd_of_lora_weights(model, num_singular_values=128, lora_id=0,
+                               output_dir='./analysis_results', layer_id=None, module_name='q_proj'):
+    """Analyze active branch maps and their fused map on concatenated inputs.
+
+    The adapter adds Dt @ x_t + Dui @ x_ui + Dimg @ x_img (column notation).
+    Its fused operator is [Dt Dui Dimg], NOT Dt + Dui + Dimg, since the inputs
+    differ. It is not a single weight update that can be merged into W0.
+    Its rank is at most min(output_dim, total_input_dim, sum(branch_ranks)).
+
+    Full CPU FP32 SVD retains the numerical tail beyond the theoretical rank,
+    so the plot shows the drop and its tail up to num_singular_values. Unlike
+    reduced QR, this requires materializing the dense matrices and costs more
+    CPU time/memory. Tiny tail values are roundoff, not additional effective rank.
+    """
+    if num_singular_values <= 0:
+        raise ValueError('num_singular_values must be positive.')
+    layer_name, layer = select_lora_layer(model, lora_id, layer_id, module_name)
     os.makedirs(output_dir, exist_ok=True)
-
-    lora_layers = [(name, module) for name, module in model.named_modules() if isinstance(module, MultiModalLoraLayer)]
-    if not lora_layers:
-        print("Cannot find MultiModalLoraLayer in model.")
-        return {}
-    if lora_id >= len(lora_layers):
-        raise ValueError(f"lora_id {lora_id} is out of range. Found {len(lora_layers)} LoRA layers.")
-
-    layer_name, lora_layer = lora_layers[lora_id]
-    scaling = lora_layer.scaling
-    r_val = lora_layer.lora_A_t.shape[0]
-
-    print("\n" + "=" * 80)
-    print("Start SVD Analysis for MoDLoRA-based Model")
-    print(f"Selected Layer: {layer_name}")
-    print(f"Adapter Rank (r): {r_val}")
-
-    delta_w_t = compute_delta_w(lora_layer.lora_A_t.data, lora_layer.lora_B_t.data, scaling)
-
-    ui_scaling = lora_layer.ui_multimodal_scaling.detach()
-    delta_w_ui = compute_delta_w(lora_layer.lora_A_ui.data, lora_layer.lora_B_ui.data, scaling * ui_scaling)
-    print(f"UI scaling: {ui_scaling.item():.4f}")
-
-    matrices = {
-        'Text_$\\Delta$W': delta_w_t,
-        'UI_$\\Delta$W': delta_w_ui,
-    }
-    delta_w_fused = delta_w_t + delta_w_ui
-
-    if getattr(lora_layer, "use_image_lora", False) and lora_layer.lora_A_img is not None:
-        image_scaling = lora_layer.image_multimodal_scaling.detach()
-        delta_w_img = compute_delta_w(lora_layer.lora_A_img.data, lora_layer.lora_B_img.data, scaling * image_scaling)
-        matrices['Image_$\\Delta$W'] = delta_w_img
-        delta_w_fused = delta_w_fused + delta_w_img
-        print(f"Image scaling: {image_scaling.item():.4f}")
+    branches = {'text': (layer.lora_A_t, layer.lora_B_t, layer.scaling)}
+    if context_branches_active(layer):
+        branches['ui'] = (layer.lora_A_ui, layer.lora_B_ui,
+                          layer.scaling * layer.ui_multimodal_scaling.item())
+        if layer.use_image_lora:
+            branches['image'] = (layer.lora_A_img, layer.lora_B_img,
+                                 layer.scaling * layer.image_multimodal_scaling.item())
+        else:
+            print(f'{layer_name}: image LoRA is disabled; analyzing text/UI only.')
     else:
-        print("Image LoRA branch is not enabled; SVD will cover Text and UI only.")
+        print(f'{layer_name}: UI/image branches are inactive; analyzing text only.')
 
-    fused_label = 'Fused_(Text+UI+Image)_$\\Delta$W' if 'Image_$\\Delta$W' in matrices else 'Fused_(Text+UI)_$\\Delta$W'
-    fused_matrices = {fused_label: delta_w_fused}
+    print(f'\nFull FP32 LoRA weight SVD at {layer_name}')
+    print('Values beyond the theoretical rank show the floating-point numerical tail.')
     results = {}
 
-    def plot_matrix_group(matrices_dict, filename, rank_checkpoints, rank_labels):
-        plt.figure(figsize=(10, 6))
-        for label, delta_w in matrices_dict.items():
-            s = torch.linalg.svdvals(delta_w.to(torch.float32)).detach().cpu().numpy()
-            num_to_plot = min(len(s), num_singular_values)
-            s_plot = s[:num_to_plot]
-            indices = np.arange(1, num_to_plot + 1)
-            variance_ratio = np.sum(s_plot ** 2) / np.sum(s ** 2) if np.sum(s ** 2) > 0 else 0
+    def record(key, delta_w, rank_upper_bound, scale):
+        # Do not reduce to an r x r matrix: doing so discards the tail we plot.
+        values = torch.linalg.svdvals(delta_w).double().numpy()
+        shape = tuple(delta_w.shape)
+        count = min(num_singular_values, len(values))
+        energy = float(np.sum(values ** 2))
+        ratio = float(np.sum(values[:count] ** 2) / energy) if energy else 0.0
+        tolerance = max(shape) * np.finfo(np.float32).eps * values[0]
+        results[key] = {
+            'shape': list(shape),
+            'scaling': float(scale),
+            'rank_upper_bound': min(*shape, rank_upper_bound),
+            'numerical_rank': int(np.count_nonzero(values > tolerance)),
+            'rank_tolerance': float(tolerance),
+            'singular_values': values.tolist(),
+            'implicit_zero_count': 0,
+            'plotted_singular_values': values[:count].tolist(),
+            f'top_{count}_energy_ratio': ratio,
+        }
+        print(f"{key:<8} shape={shape}, scale={float(scale):.4f}, "
+              f"rank={results[key]['numerical_rank']} <= {results[key]['rank_upper_bound']}, "
+              f'top-{count} energy={ratio:.2%}')
 
-            results[label] = {
-                'shape': tuple(delta_w.shape),
-                f'top_{num_to_plot}_variance_ratio': float(variance_ratio),
-            }
-
-            print(f"\n-> SVD Results ({label})")
-            print(f"    Shape: {delta_w.shape[0]}x{delta_w.shape[1]}")
-            print(f"    First {num_to_plot} singular value ratio: {variance_ratio * 100:.2f}%")
-            plt.plot(indices, s_plot, marker='.', linestyle='-', markersize=4, label=label)
-
-        plt.xscale('log')
-        plt.yscale('log')
-        plt.xlabel('Singular Value Index $\\log(k)$', fontsize=10)
-        plt.ylabel('Singular Value $\\log(\\sigma_k)$', fontsize=10)
-        plt.grid(True, which="both", ls="--", alpha=0.5)
-        plt.legend(loc='best')
-
-        ymin, ymax = plt.ylim()
-        if ymax <= 0:
-            ymax = 1.0
-
-        colors = ['blue', 'red', 'green', 'purple']
-        for rc, label, color in zip(rank_checkpoints, rank_labels, colors):
-            plt.axvline(x=rc, color=color, linestyle='--', alpha=0.6, linewidth=1.5)
-            plt.text(rc * 1.05, ymax * 0.2, label, color=color, fontsize=12, fontweight='bold')
-
-        plt.tight_layout()
-        plot_path = os.path.join(output_dir, filename)
-        plt.savefig(plot_path, dpi=300)
-        plt.close()
-        print(f"Figure saved to: {plot_path}")
-
-    branch_count = len(matrices)
-    branch_suffix = 'text_ui_image' if branch_count == 3 else 'text_ui'
-    plot_matrix_group(matrices, f'svd_spectrum_{branch_suffix}.png', [r_val], [f'$r={r_val}$'])
-    plot_matrix_group(fused_matrices, 'svd_spectrum_fused.png', [r_val * branch_count], [f'${branch_count}r={r_val * branch_count}$'])
-
-    print("=" * 80)
-    print(f"SVD figures saved to: {output_dir}")
+    # Preallocate the fused map and fill it one branch at a time to avoid holding
+    # all three dense branch matrices plus a second concatenated copy in memory.
+    output_dim = layer.lora_B_t.shape[0]
+    input_dim = sum(a.shape[1] for a, _, _ in branches.values())
+    fused = torch.empty((output_dim, input_dim), dtype=torch.float32, device='cpu')
+    offset = 0
+    for key, (a, b, scale) in branches.items():
+        delta_w = compute_delta_w(a, b, scale)
+        record(key, delta_w, a.shape[0], scale)
+        fused[:, offset:offset + a.shape[1]] = delta_w
+        offset += a.shape[1]
+        del delta_w
+    record('fused', fused, sum(a.shape[0] for a, _, _ in branches.values()), 1.0)
+    del fused
+    plot_spectra(results, list(branches), os.path.join(output_dir, 'svd_spectrum_branches.png'))
+    plot_spectra(results, ['fused'], os.path.join(output_dir, 'svd_spectrum_fused.png'))
+    with open(os.path.join(output_dir, 'svd_results.json'), 'w', encoding='utf-8') as file:
+        json.dump({'layer': layer_name,
+                   'operator': '[' + ', '.join(f'Delta_W_{key}' for key in branches) + ']',
+                   'svd_method': 'dense_float32',
+                   'tail_note': 'Values beyond the theoretical rank are floating-point roundoff.',
+                   'results': results}, file, indent=2)
     return results
 
 
 def build_model(args, tokenizer, user_num, item_num, image_embeddings, device):
-    model_kwargs = {"torch_dtype": torch.bfloat16}
-    if torch.cuda.is_available():
-        model_kwargs["device_map"] = f"cuda:{args.devices}"
+    model_kwargs = {"torch_dtype": torch.bfloat16 if device.type == 'cuda' else torch.float32}
+    if device.type == 'cuda':
+        model_kwargs["device_map"] = str(device)
     model_llm = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
-    model_llm.gradient_checkpointing_enable()
 
     model = MoDLoRA(
         user_num=user_num,
@@ -436,28 +541,48 @@ def load_adapter_state_dict(path, map_location="cpu"):
 
 
 def load_checkpoint(model, args):
-    ckpt_path = os.path.join(args.ckpt_dir, args.dataset_name, f'{args.split_index}modlora_model.pth')
+    ckpt_path = args.checkpoint
+    if ckpt_path is None:
+        checkpoint_dir = os.path.join(args.ckpt_dir, args.dataset_name)
+        candidates = [os.path.join(checkpoint_dir, f'{args.split_index}{suffix}_model.pth')
+                      for suffix in ('modlora', 'uiadapter')]
+        ckpt_path = next((path for path in candidates if os.path.isfile(path)), candidates[0])
     if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Cannot find MoDLoRA checkpoint: {ckpt_path}")
+        raise FileNotFoundError(f"Cannot find MoDLoRA checkpoint: {ckpt_path}. "
+                                "Pass --checkpoint for an explicit .pth file. "
+                                "Three-branch analysis requires training with --use_modlora --use_multimodal.")
     state = load_adapter_state_dict(ckpt_path, map_location="cpu")
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    # main.py saves trainable parameters only. Missing frozen backbone weights
+    # and image buffers are expected; missing learned branch weights are not.
+    trainable_names = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+    missing = sorted(trainable_names - state.keys())
+    unexpected = sorted(state.keys() - model.state_dict().keys())
+    if missing or unexpected:
+        raise ValueError('Checkpoint does not match the current CIER MoDLoRA architecture. '
+                         f'Missing trainable parameters: {missing[:10]}; '
+                         f'unexpected parameters: {unexpected[:10]}. '
+                         'Check the backbone, r, id_hidden, lora_modules and image-branch setting. '
+                         'For a legacy text/UI checkpoint use --no_multimodal; '
+                         'three-branch SVD requires trained image LoRA weights.')
+    model.load_state_dict(state, strict=False)
     print(f"Loaded checkpoint: {ckpt_path}")
-    if missing:
-        print(f"Missing keys: {len(missing)}")
-    if unexpected:
-        print(f"Unexpected keys: {len(unexpected)}")
-        if not args.use_multimodal and any('img' in key or 'image' in key for key in unexpected):
-            print("Warning: checkpoint has image branch weights, but --use_multimodal was not enabled.")
 
 
 def resolve_cuda_index(devices):
     return 0 if devices < 0 else devices
 
 
+def positive_int(value):
+    value = int(value)
+    if value <= 0:
+        raise ArgumentTypeError('must be a positive integer')
+    return value
+
+
 def parse_args():
-    parser = ArgumentParser(description='CIER MoDLoRA multimodal analysis')
+    parser = ArgumentParser(description='Analyze text/UI/image LoRA branches in CIER MoDLoRA')
     parser.add_argument('--devices', default=-1, type=int, help='Select which GPU to use.')
-    parser.add_argument('--batch_size', default=40, type=int)
+    parser.add_argument('--batch_size', default=40, type=positive_int)
     parser.add_argument('--seed', default=5254, type=int)
     parser.add_argument('--epochs', default=3, type=int)
     parser.add_argument('--learning_rate', default=1e-3, type=float)
@@ -469,26 +594,53 @@ def parse_args():
     parser.add_argument('--show_train_loss_steps', default=500, type=int)
     parser.add_argument('--id_hidden', default=1024, type=int)
     parser.add_argument('--only_eval', action='store_true')
-    parser.add_argument('--dataset_name', default='MoviesAndTV', type=str)
-    parser.add_argument('--data_dir', default='./data/', type=str)
-    parser.add_argument('--model_name', default='../autodl-fs/Qwen2.5-7B/', type=str)
+    parser.add_argument('--dataset_name', default='ClothingShoesAndJewelry', type=str)
+    parser.add_argument('--data_dir', default='../data/', type=str)
+    parser.add_argument('--model_name', default='/root/autodl-fs/Qwen2.5-7B/', type=str)
     parser.add_argument('--ckpt_dir', default='./checkpoints/', type=str)
+    parser.add_argument('--checkpoint', default=None,
+                        help='explicit trained MoDLoRA .pth file; overrides ckpt_dir and split_index')
     parser.add_argument('--log_dir', default='./log/', type=str)
     parser.add_argument('--log_name', default='llama.log', type=str)
     parser.add_argument('--split_index', default='1', type=str)
-    parser.add_argument('--lora_modules', type=int, default=2)
-    parser.add_argument('--r', type=int, default=4)
-    parser.add_argument('--use_multimodal', action='store_true', help='Enable item-image LoRA branch for analysis.')
+    parser.add_argument('--lora_modules', type=int, choices=range(1, 8), default=2)
+    parser.add_argument('--r', type=positive_int, default=4)
+    modality_group = parser.add_mutually_exclusive_group()
+    modality_group.add_argument('--use_multimodal', dest='use_multimodal', action='store_true',
+                                help='analyze text/UI/image branches (default)')
+    modality_group.add_argument('--no_multimodal', dest='use_multimodal', action='store_false',
+                                help='analyze a legacy text/UI checkpoint without image LoRA')
+    parser.set_defaults(use_multimodal=True)
     parser.add_argument('--clip_model', default=None, type=str)
     parser.add_argument('--image_dir', default='images', type=str)
     parser.add_argument('--image_embedding_path', default=None, type=str)
     parser.add_argument('--ui_multimodal_scale', default=2.0, type=float)
     parser.add_argument('--image_multimodal_scale', default=2.0, type=float)
-    parser.add_argument('--num_batches', default=10, type=int)
-    parser.add_argument('--num_singular_values', default=100, type=int)
-    parser.add_argument('--lora_id', default=0, type=int)
+    parser.add_argument('--num_batches', default=16, type=positive_int,
+                        help='maximum test batches used for modality cosine/Pearson correlations')
+    parser.add_argument('--num_singular_values', default=4, type=positive_int,
+                        help='number of full-spectrum points to plot, including the numerical tail')
+    layer_group = parser.add_mutually_exclusive_group()
+    layer_group.add_argument('--lora_id', default=None, type=int,
+                             help='legacy flattened LoRA index in named_modules(), not the Transformer layer number')
+    layer_group.add_argument('--layer_id', default=None, type=int,
+                             help='zero-based Transformer layer number, e.g. 12 selects layers.12')
+    parser.add_argument('--module_name', default='q_proj',
+                        choices=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'],
+                        help='projection to analyze with --layer_id (default: q_proj); must contain trained LoRA weights')
+    parser.add_argument('--analysis', choices=['both', 'correlation', 'svd'], default='both',
+                        help='both (default): similarity + SVD; correlation: similarity only; svd: weights only')
     parser.add_argument('--output_dir', default='./analysis_results', type=str)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.lora_id is None:
+        args.lora_id = 0
+    if args.lora_id < 0:
+        parser.error('lora_id must be nonnegative.')
+    if args.layer_id is not None and args.layer_id < 0:
+        parser.error('layer_id must be nonnegative.')
+    if args.layer_id is None and args.module_name != 'q_proj':
+        parser.error('--module_name requires --layer_id.')
+    return args
 
 
 def main():
@@ -499,25 +651,33 @@ def main():
 
     user_num, item_num = infer_user_item_num(args.dataset_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    dataset = load_or_build_dataset(args, tokenizer)
-
-    _, _, test_dataset = dataset_split(dataset, args.split_index, args)
-    test_set = MyDataset(test_dataset)
-    collate_test = MyCollater(1, args.word)
-    test_dataloader = DataLoader(test_set, batch_size=args.batch_size, collate_fn=collate_test, shuffle=False)
 
     image_embeddings = build_multimodal_image_embeddings(args, item_num, device)
     model = build_model(args, tokenizer, user_num, item_num, image_embeddings, device)
     load_checkpoint(model, args)
+    model.eval()
 
-    print("\n=== [Start Analysis of Subspace Decoupling and Spectral Extension for CIER] ===")
-    analyze_correlation(model, test_dataloader, device, num_batches=args.num_batches)
-    analyze_svd_of_lora_weights(
-        model,
-        num_singular_values=args.num_singular_values,
-        lora_id=args.lora_id,
-        output_dir=args.output_dir,
-    )
+    print("\n=== [CIER MoDLoRA Modality and Weight-Spectrum Analysis] ===")
+    if args.analysis in ('both', 'correlation'):
+        dataset = load_or_build_dataset(args, tokenizer)
+        _, _, test_dataset = dataset_split(dataset, args.split_index, args)
+        test_set = MyDataset(test_dataset)
+        if not len(test_set):
+            raise ValueError('The test split is empty; correlation requires test samples.')
+        collate_test = AnalysisCollater(1, args.word)
+        test_dataloader = DataLoader(test_set, batch_size=args.batch_size, collate_fn=collate_test, shuffle=False)
+        analyze_correlation(model, test_dataloader, device, num_batches=args.num_batches,
+                            lora_id=args.lora_id, output_dir=args.output_dir,
+                            layer_id=args.layer_id, module_name=args.module_name)
+    if args.analysis in ('both', 'svd'):
+        analyze_svd_of_lora_weights(
+            model,
+            num_singular_values=args.num_singular_values,
+            lora_id=args.lora_id,
+            output_dir=args.output_dir,
+            layer_id=args.layer_id,
+            module_name=args.module_name,
+        )
 
 
 if __name__ == "__main__":
