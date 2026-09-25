@@ -2,18 +2,16 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-orange)](LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)](https://pytorch.org/)
 
-uiAdapter: User-Item Adapter for LLM-based Explainable Recommendation Systems
-
-uiAdapter is an efficient fine-tuning strategy for LLM-based explainable recommendations. It decouples the adaptation processes of text and recommendation. 
+MoDLoRA is an efficient fine-tuning strategy for LLM-based explainable recommendations. It decouples the adaptation processes of text, image, and recommendation. 
 
 Recommendation paradigms are revised from their original projects:
 
 - **CIER**: https://github.com/karrich/CIER
 - **PEPLER**: https://github.com/lileipisces/PEPLER
 
-## 🧠uiAdapter Framework
+## 🧠MoDLoRA Framework
 <p align="center">
-<img src="figures/uiAdapter.png" width="700">
+<img src="figures/MoDLoRA.png" width="700">
 </p>
 
 
@@ -48,10 +46,9 @@ Organize the data as follows:
 │   └── utils.py
 ├── data/
 │   ├── ClothingShoesAndJewelry/
-│   ├── MoviesAndTV/
-│   └── TripAdvisor/
+│   └── MoviesAndTV/
 ├── figures/
-│   └── uiAdapter.png
+│   └── MoDLoRA.png
 ├── llms/
 │   ├── gemma-7b/
 │   ├── Mistral-7B-Instruct-v0.3/
@@ -67,8 +64,8 @@ Prerequisites
 - CUDA-enabled GPU (e.g., RTX 5090)
 
 ```bash
-git clone https://github.com/XiuzeZhou/uiAdapter.git
-cd uiAdapter
+git clone https://github.com/XiuzeZhou/MoDLoRA.git
+cd MoDLoRA
 pip install -r requirements.txt
 ```
 
@@ -79,15 +76,13 @@ pip install -r requirements.txt
 
 - ClothingShoesAndJewelry.zip
 - MoviesAndTV.zip
-- TripAdvisor.zip
 
 ​    2). Move .zip files to `data/` and unzip. Organize the data as follows:
 
 ```
 ├── data/
 │   ├── ClothingShoesAndJewelry/
-│   ├── MoviesAndTV/
-│   └── TripAdvisor/
+│   └── MoviesAndTV/
 ```
 
 
@@ -129,8 +124,17 @@ cd PEPLER
 ```
 ### 4. SVD Analysis
    To verify the modality independence and spectral distribution:
+
+**CIER:**
+
 ```
-python analysis.py --dataset_name ClothingShoesAndJewelry
+python analysis.py --analysis both --model_name /root/autodl-fs/Qwen2.5-7B/ --ckpt_dir ./checkpoints/ --dataset_name ClothingShoesAndJewelry --split_index 1 --module_name q_proj --num_singular_values 4 --layer_id 6 --devices 0
+```
+
+or **PEPLER:**
+
+```
+python analysis.py --analysis both --llm_model /root/autodl-fs/gemma-7b/ --checkpoint ./checkpoints/ClothingShoesAndJewelry/model.pt --module_name q_proj --num_singular_values 8 --layer_id 6 --cuda
 ```
 
 ## 📝 Citation
