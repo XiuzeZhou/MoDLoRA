@@ -202,7 +202,7 @@ class MultiModalLoraLayer(nn.Module):
         result = self.base_layer(x) + lora_t + lora_ui + lora_img
         return result
 
-class uiAdapter(nn.Module):
+class MoDLoRA(nn.Module):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, nuser, nitem, k, r, mlp_size, lora_modules, dtype=torch.bfloat16, image_embeddings=None,
                         ui_multimodal_scale=1.0, image_multimodal_scale=1.0, **kwargs):
@@ -238,7 +238,7 @@ class uiAdapter(nn.Module):
         self.f_item = nn.Linear(k, k, dtype=dtype)
         self.f_ui = nn.Linear(k * 2, emsize, dtype=dtype)
         if image_embeddings is None:
-            raise ValueError("image_embeddings is required for uiAdapter image LoRA. Generate it with DataLoader and CLIP first.")
+            raise ValueError("image_embeddings is required for MoDLoRA image LoRA. Generate it with DataLoader and CLIP first.")
         image_embeddings = self.build_image_embedding_table(image_embeddings, nitem)
         if image_embeddings.dim() != 2:
             raise ValueError("image_embeddings should be a 2-D tensor shaped as (nitem, image_dim)")
@@ -499,7 +499,7 @@ class Concat_LoRA(nn.Module):
         self.item_projector = nn.Linear(k, self.hidden_size, dtype=dtype)
         if image_embeddings is None:
             raise ValueError("image_embeddings is required for multimodal Concat_LoRA. Generate it with DataLoader and CLIP first.")
-        image_embeddings = uiAdapter.build_image_embedding_table(image_embeddings, nitem)
+        image_embeddings = MoDLoRA.build_image_embedding_table(image_embeddings, nitem)
         if image_embeddings.dim() != 2:
             raise ValueError("image_embeddings should be a 2-D tensor shaped as (nitem, image_dim)")
         self.image_dim = image_embeddings.size(1)
