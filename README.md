@@ -11,7 +11,7 @@ Recommendation paradigms are revised from their original projects:
 
 ## 🧠MoDLoRA Framework
 <p align="center">
-<img src="figures/MoDLoRA.png" width="700">
+<img src="figures/framework.png" width="700">
 </p>
 
 
@@ -48,7 +48,7 @@ Organize the data as follows:
 │   ├── ClothingShoesAndJewelry/
 │   └── MoviesAndTV/
 ├── figures/
-│   └── MoDLoRA.png
+│   └── framework.png
 ├── llms/
 │   ├── gemma-7b/
 │   ├── Mistral-7B-Instruct-v0.3/
