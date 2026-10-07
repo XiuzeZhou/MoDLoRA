@@ -202,10 +202,115 @@ class MultiModalLoraLayer(nn.Module):
         result = self.base_layer(x) + lora_t + lora_ui + lora_img
         return result
 
+
+class SharedMultiModalLoraLayer(nn.Module):
+    def __init__(
+        self,
+        base_layer,
+        hidden_size=4096,
+        dtype=torch.bfloat16,
+        **kwargs
+    ):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.base_layer = base_layer
+
+        for param in self.base_layer.parameters():
+            param.requires_grad = False
+
+        r = kwargs.pop("r", 24)
+        lora_alpha = kwargs.pop("lora_alpha", r)
+        lora_dropout = kwargs.pop("lora_dropout", 0.0)
+
+        in_features = base_layer.in_features
+        out_features = base_layer.out_features
+
+        # Only ONE shared LoRA operator
+        self.lora_A = nn.Parameter(
+            torch.randn(r, in_features, dtype=dtype)
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros(out_features, r, dtype=dtype)
+        )
+
+        self.scaling = lora_alpha / r
+        self.lora_dropout = nn.Dropout(lora_dropout)
+
+        self.x_ui = None
+        self.x_img = None
+
+    def _align_context(self, context, batch_size):
+        if context is None:
+            return None
+
+        if context.size(0) == batch_size:
+            return context
+
+        if batch_size % context.size(0) == 0:
+            repeat = batch_size // context.size(0)
+            return context.repeat_interleave(repeat, dim=0)
+
+        context = context[:batch_size]
+
+        return context if context.size(0) == batch_size else None
+
+    def _shared_lora(self, z):
+        return (
+            self.lora_dropout(z)
+            @ self.lora_A.transpose(0, 1).to(z.dtype)
+            @ self.lora_B.transpose(0, 1).to(z.dtype)
+            * self.scaling
+        )
+
+    def _context_lora(self, context, x):
+        if (
+            context is None
+            or x.dim() < 3
+            or self.base_layer.in_features != self.hidden_size
+        ):
+            return 0
+
+        batch_size = x.size(0)
+
+        current_context = self._align_context(
+            context, batch_size
+        )
+
+        if current_context is None:
+            return 0
+
+        current_context = (
+            current_context
+            .to(device=x.device, dtype=x.dtype)
+            .unsqueeze(1)
+            .expand(-1, x.size(1), -1)
+        )
+
+        return self._shared_lora(current_context)
+
+    def forward(self, x):
+
+        # Same ΔW applied to text
+        lora_t = self._shared_lora(x)
+
+        # Same ΔW applied to UI
+        lora_ui = self._context_lora(self.x_ui, x)
+
+        # Same ΔW applied to image
+        lora_img = self._context_lora(self.x_img, x)
+
+        return (
+            self.base_layer(x)
+            + lora_t
+            + lora_ui
+            + lora_img
+        )
+
 class MoDLoRA(nn.Module):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, nuser, nitem, k, r, mlp_size, lora_modules, dtype=torch.bfloat16, image_embeddings=None,
-                        ui_multimodal_scale=1.0, image_multimodal_scale=1.0, **kwargs):
+                        ui_multimodal_scale=1.0, image_multimodal_scale=1.0, is_shared=False, **kwargs):
         quantization_config = BitsAndBytesConfig(load_in_8bit=True)
         base_model = AutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path, 
@@ -218,12 +323,12 @@ class MoDLoRA(nn.Module):
             base_model, nuser, nitem, k, r, mlp_size, lora_modules,
             dtype, pretrained_model_name_or_path, image_embeddings=image_embeddings,
             ui_multimodal_scale=ui_multimodal_scale,
-            image_multimodal_scale=image_multimodal_scale
+            image_multimodal_scale=image_multimodal_scale,
+            is_shared=is_shared
         )
     
     def __init__(self, base_model, nuser, nitem, k, r, mlp_size, lora_modules, dtype=torch.bfloat16, pretrained_model_name_or_path="",
-                 image_embeddings=None, ui_multimodal_scale=1.0,
-                 image_multimodal_scale=1.0):
+                 image_embeddings=None, ui_multimodal_scale=1.0, image_multimodal_scale=1.0, is_shared=False):
         super().__init__()
         self.model = base_model
         self.dtype = dtype
@@ -296,6 +401,16 @@ class MoDLoRA(nn.Module):
                     ui_multimodal_scale=ui_multimodal_scale,
                     image_multimodal_scale=image_multimodal_scale
                 )
+                if is_shared:
+                    shared_r = 3 * r
+                    new_layer = SharedMultiModalLoraLayer(
+                        base_layer=base_layer,
+                        dtype=self.dtype,
+                        r=shared_r,
+                        lora_alpha=shared_r,
+                        lora_dropout=0.1,
+                        hidden_size=self.model.config.hidden_size
+                    )
                 
                 parts = name.rsplit('.', 1)
                 if len(parts) == 1:
@@ -349,7 +464,7 @@ class MoDLoRA(nn.Module):
         if x_img is not None:
             x_img = F.normalize(x_img.to(torch.float32), p=2, dim=-1).to(self.dtype)
         for module in self.modules():
-            if isinstance(module, MultiModalLoraLayer):
+            if isinstance(module, MultiModalLoraLayer) or isinstance(module, SharedMultiModalLoraLayer):
                 module.x_ui = x_ui
                 module.x_img = x_img
 
@@ -464,10 +579,411 @@ class MoDLoRA(nn.Module):
         return predicted_rating
 
 
+def _dequantize_linear_weight(base_layer):
+    """
+    Return base-layer weight as a normal floating-point tensor.
+
+    Supports:
+      1. torch.nn.Linear
+      2. bitsandbytes Linear8bitLt / Int8Params
+      3. bitsandbytes Linear4bit / Params4bit (also works if used later)
+
+    The DoRA implementation itself does NOT require PEFT,
+    but for reliable bitsandbytes dequantization we preferentially
+    use PEFT's helper.
+    """
+
+    # ---------------------------------------------------------
+    # Preferred route: PEFT helper.
+    # It correctly handles bnb Int8Params / Params4bit.
+    # ---------------------------------------------------------
+    try:
+        from peft.utils.integrations import dequantize_module_weight
+        return dequantize_module_weight(base_layer)
+
+    except (ImportError, AttributeError):
+        pass
+
+    # ---------------------------------------------------------
+    # Fallback: recent Transformers also provides a bnb helper.
+    # ---------------------------------------------------------
+    weight = base_layer.weight
+    weight_cls = weight.__class__.__name__
+
+    if weight_cls in ("Int8Params", "Params4bit"):
+        try:
+            from transformers.integrations.bitsandbytes import (
+                dequantize_bnb_weight,
+            )
+
+            state = getattr(base_layer, "state", None)
+            return dequantize_bnb_weight(weight, state)
+
+        except (ImportError, AttributeError, TypeError) as exc:
+            raise RuntimeError(
+                "The base layer is bitsandbytes-quantized, but its "
+                "weight could not be safely dequantized. "
+                "Install/update `peft`, which provides "
+                "`peft.utils.integrations.dequantize_module_weight`."
+            ) from exc
+
+    # Ordinary nn.Linear
+    return weight
+
+
+class DoRALayer(nn.Module):
+    """
+    Drop-in replacement for the original LoraLayer.
+
+    For an ordinary Linear layer:
+
+        V = W0 + s * B A
+
+        W_DoRA = diag(m / ||V||_row) V
+
+    and
+
+        y = W_DoRA x + bias
+
+    where:
+        - A, B learn the directional update;
+        - m is a trainable magnitude vector;
+        - s = lora_alpha / r.
+
+    Notes
+    -----
+    * Designed for the Qwen / Mistral / Gemma linear modules used
+      in the current code.
+    * Compatible with base layers loaded with load_in_8bit=True.
+    * The frozen quantized base layer is still used for its normal
+      forward pass.
+    * Only the current base matrix is temporarily dequantized when
+      the DoRA normalization factor is calculated.
+    """
+
+    def __init__(
+        self,
+        base_layer,
+        hidden_size=4096,
+        dtype=torch.bfloat16,
+        **kwargs
+    ):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.base_layer = base_layer
+
+        # Freeze pretrained / quantized base layer
+        for param in self.base_layer.parameters():
+            param.requires_grad = False
+
+        r = kwargs.pop("r", 8)
+        lora_alpha = kwargs.pop("lora_alpha", 16)
+        lora_dropout = kwargs.pop("lora_dropout", 0.0)
+        eps = kwargs.pop("dora_eps", 1e-6)
+
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.scaling = lora_alpha / r
+        self.eps = eps
+
+        in_features = base_layer.in_features
+        out_features = base_layer.out_features
+
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Put newly created adapter parameters on the same device
+        # as the quantized base layer.
+        adapter_device = base_layer.weight.device
+
+        # -----------------------------------------------------
+        # LoRA directional component
+        # -----------------------------------------------------
+        self.lora_A_t = nn.Parameter(
+            torch.empty(
+                r,
+                in_features,
+                dtype=dtype,
+                device=adapter_device,
+            )
+        )
+
+        self.lora_B_t = nn.Parameter(
+            torch.zeros(
+                out_features,
+                r,
+                dtype=dtype,
+                device=adapter_device,
+            )
+        )
+
+        # Standard LoRA-style initialization:
+        # A random, B zero -> initial delta W = 0.
+        nn.init.kaiming_uniform_(
+            self.lora_A_t,
+            a=math.sqrt(5)
+        )
+        nn.init.zeros_(self.lora_B_t)
+
+        self.lora_dropout = nn.Dropout(lora_dropout)
+
+        # -----------------------------------------------------
+        # DoRA magnitude component
+        #
+        # m_i is initialized as ||W0_i||_2.
+        #
+        # Keep magnitude in FP32:
+        # it is tiny compared with A/B and improves numerical
+        # stability when the base model is int8/bfloat16.
+        # -----------------------------------------------------
+        with torch.no_grad():
+            base_weight = _dequantize_linear_weight(
+                self.base_layer
+            )
+
+            # Qwen/Mistral/Gemma use ordinary Linear convention:
+            # [out_features, in_features].
+            #
+            # Optional fallback for GPT-style Conv1D.
+            if (
+                base_weight.shape[0] == in_features
+                and base_weight.shape[1] == out_features
+                and base_weight.shape
+                != (out_features, in_features)
+            ):
+                base_weight = base_weight.transpose(0, 1)
+
+            if base_weight.shape != (
+                out_features,
+                in_features,
+            ):
+                raise ValueError(
+                    "Unexpected base weight shape for DoRA: "
+                    f"{tuple(base_weight.shape)}, expected "
+                    f"({out_features}, {in_features})."
+                )
+
+            magnitude_init = torch.linalg.vector_norm(
+                base_weight.float(),
+                ord=2,
+                dim=1,
+            )
+
+            magnitude_init = magnitude_init.clamp_min(
+                self.eps
+            )
+
+        self.dora_magnitude = nn.Parameter(
+            magnitude_init.to(
+                device=adapter_device,
+                dtype=torch.float32,
+            ),
+            requires_grad=True,
+        )
+
+        # Release the temporary dense dequantized matrix.
+        del base_weight
+        del magnitude_init
+
+    @torch.no_grad()
+    def _compute_weight_norm(self):
+        """
+        Compute
+
+            || W0 + scaling * B A ||_2
+
+        row-wise.
+
+        Importantly:
+          * no gradient is propagated through the norm;
+          * W0 is dequantized only temporarily;
+          * no permanent FP16/FP32 copy of W0 is stored.
+
+        Detaching the normalization denominator follows the
+        practical DoRA formulation.
+        """
+
+        # Dequantize only the current frozen layer.
+        base_weight = _dequantize_linear_weight(
+            self.base_layer
+        )
+
+        # Standard Linear orientation: [out, in]
+        if (
+            base_weight.shape[0] == self.in_features
+            and base_weight.shape[1] == self.out_features
+            and base_weight.shape
+            != (self.out_features, self.in_features)
+        ):
+            base_weight = base_weight.transpose(0, 1)
+
+        # Norm computation in FP32 for stability.
+        base_weight = base_weight.float()
+
+        # delta_W = B A
+        #
+        # This is intentionally constructed under no_grad().
+        # Gradients for A/B come from the low-rank forward below,
+        # not from the DoRA normalization denominator.
+        delta_weight = torch.matmul(
+            self.lora_B_t.float(),
+            self.lora_A_t.float(),
+        )
+
+        direction_weight = (
+            base_weight
+            + self.scaling * delta_weight
+        )
+
+        weight_norm = torch.linalg.vector_norm(
+            direction_weight,
+            ord=2,
+            dim=1,
+        )
+
+        weight_norm = weight_norm.clamp_min(
+            self.eps
+        )
+
+        return weight_norm
+
+    def forward(self, x):
+        """
+        Efficient DoRA forward:
+
+        base = W0 x + b
+        low_rank = BA x
+
+        g = m / ||W0 + s BA||
+
+        result =
+            base
+            + (g - 1) * W0 x
+            + g * s * BA x
+
+        which is equivalent to
+
+            g (W0 + s BA) x + b
+
+        while keeping the quantized W0 forward intact.
+        """
+
+        # -----------------------------------------------------
+        # 1. Quantized frozen base forward.
+        #
+        # With Linear8bitLt this still uses bitsandbytes.
+        # -----------------------------------------------------
+        base_result = self.base_layer(x)
+
+        result_dtype = base_result.dtype
+
+        # -----------------------------------------------------
+        # 2. Low-rank directional update
+        # -----------------------------------------------------
+        adapter_x = self.lora_dropout(x)
+
+        # Explicit dtype conversion is useful because hidden-state
+        # dtype can differ from adapter dtype under mixed precision.
+        adapter_x = adapter_x.to(
+            self.lora_A_t.dtype
+        )
+
+        lora_result = (
+            adapter_x
+            @ self.lora_A_t.transpose(0, 1)
+            @ self.lora_B_t.transpose(0, 1)
+        )
+
+        # -----------------------------------------------------
+        # 3. DoRA direction norm
+        #
+        # The norm itself is detached / no_grad.
+        # -----------------------------------------------------
+        weight_norm = self._compute_weight_norm()
+
+        magnitude_scale = (
+            self.dora_magnitude / weight_norm
+        )
+
+        # Cast only after division.
+        magnitude_scale = magnitude_scale.to(
+            device=base_result.device,
+            dtype=result_dtype,
+        )
+
+        # Broadcast:
+        #   [out] -> [1, 1, out] for transformer hidden states
+        #
+        # Also works for [B, out].
+        scale_shape = (
+            [1] * (base_result.dim() - 1)
+            + [self.out_features]
+        )
+
+        magnitude_scale = magnitude_scale.view(
+            *scale_shape
+        )
+
+        # -----------------------------------------------------
+        # 4. Bias should NOT be magnitude-scaled.
+        #
+        # base_result = W0 x + b
+        # base_no_bias = W0 x
+        # -----------------------------------------------------
+        base_no_bias = base_result
+
+        bias = getattr(
+            self.base_layer,
+            "bias",
+            None,
+        )
+
+        if bias is not None:
+            bias_view_shape = (
+                [1] * (base_result.dim() - 1)
+                + [self.out_features]
+            )
+
+            bias_for_output = bias.to(
+                device=base_result.device,
+                dtype=result_dtype,
+            ).view(*bias_view_shape)
+
+            base_no_bias = (
+                base_result - bias_for_output
+            )
+
+        # -----------------------------------------------------
+        # 5. DoRA result
+        #
+        # base + DoRA residual:
+        #
+        # base
+        # + (g - 1) base_without_bias
+        # + g s BAx
+        # -----------------------------------------------------
+        dora_residual = (
+            (magnitude_scale - 1.0)
+            * base_no_bias
+        )
+
+        dora_residual = (
+            dora_residual
+            + magnitude_scale
+            * lora_result.to(result_dtype)
+            * self.scaling
+        )
+
+        result = base_result + dora_residual
+
+        return result
+
+
 class Concat_LoRA(nn.Module):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, nuser, nitem, k, r, mlp_size, lora_modules,
-                        dtype=torch.bfloat16, image_embeddings=None, **kwargs):
+                        dtype=torch.bfloat16, image_embeddings=None, is_dora=False, **kwargs):
         quantization_config = BitsAndBytesConfig(load_in_8bit=True)
         base_model = AutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path, 
@@ -478,11 +994,11 @@ class Concat_LoRA(nn.Module):
         #base_model.gradient_checkpointing_enable()
         return cls(
             base_model, nuser, nitem, k, r, mlp_size, lora_modules, dtype,
-            pretrained_model_name_or_path, image_embeddings=image_embeddings
+            pretrained_model_name_or_path, image_embeddings=image_embeddings, is_dora=is_dora
         )
 
     def __init__(self, base_model, nuser, nitem, k, r, mlp_size, lora_modules, dtype,
-                 pretrained_model_name_or_path, image_embeddings=None):
+                 pretrained_model_name_or_path, image_embeddings=None, is_dora=False):
         super().__init__()
         self.model = base_model
         self.dtype = dtype
@@ -542,7 +1058,8 @@ class Concat_LoRA(nn.Module):
                 if not hasattr(base_layer, "in_features"): base_layer.in_features = in_f
                 if not hasattr(base_layer, "out_features"): base_layer.out_features = out_f
 
-                new_layer = LoraLayer(
+                AdapterLayer = DoRALayer if is_dora else LoraLayer
+                new_layer = AdapterLayer(
                     base_layer=base_layer,
                     dtype=self.dtype,
                     r=r,
@@ -550,7 +1067,7 @@ class Concat_LoRA(nn.Module):
                     lora_dropout=0.1,
                     hidden_size=self.hidden_size
                 )
-                
+                                    
                 parts = name.rsplit('.', 1)
                 parent_module = self.model.get_submodule(parts[0]) if len(parts) > 1 else self.model
                 setattr(parent_module, parts[-1], new_layer)
