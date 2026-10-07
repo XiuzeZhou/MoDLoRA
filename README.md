@@ -120,7 +120,7 @@ cd PEPLER
 ​    2). To train our model with the optimal parameters:
 
 ```bash
-./shell/train.sh 0
+./shell/train.sh 0 modlora
 ```
 ### 4. SVD Analysis
    To verify the modality independence and spectral distribution:
