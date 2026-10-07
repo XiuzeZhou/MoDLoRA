@@ -18,7 +18,7 @@ parser.add_argument('-llm_model', '--llm_model', type=str, default="./llm/Qwen2.
                     help='LLM backbone')
 parser.add_argument('-clip_model', '--clip_model', type=str, default="./llm/clip-vit-base-patch32/",
                     help='CLIP model path used to generate item image embeddings')
-parser.add_argument('-model_type', '--model_type', type=str, default="lora", choices=['modlora', 'lora', 'dora'],
+parser.add_argument('-model_type', '--model_type', type=str, default="modlora", choices=['modlora', 'lora', 'dora'],
                     help='model architecture pipeline: multimodal ui/image LoRA or multimodal concat')
 parser.add_argument('-lr', '--lr', type=float, default=1e-7,
                     help='learning rate for the model')
