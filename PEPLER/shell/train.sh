@@ -1,6 +1,6 @@
 echo $1
 SEED=111
-model_name=/modlora_qwen/
+model_name=/train_qwen/
 data_path=../data/
 data_name=/reviews.pickle
 LLM_MODEL=/root/autodl-fs/Qwen2.5-7B/
@@ -12,7 +12,7 @@ out_log_dir=./logs/
 out_log=train.log
 LR=2e-7
 K=768
-RANK=8
+RANK=24
 EPOCHS=1
 BATCH_SIZE=16
 RATING_REG=0.01
@@ -21,6 +21,7 @@ MLP_SIZE=400
 UI_SCALING=2.0
 IMAGE_SCALING=2.0
 ACC_STEPS=1
+MODEL_TYPE=modlora
 
 for d_type in ClothingShoesAndJewelry MoviesAndTV
 do
@@ -55,7 +56,7 @@ do
             -checkpoint ${checkpoint_dir}${d_type} \
             -outf ${out_file_dir}${d_type}\/${d_index}${model_name}${out_file_name} \
             -words 20 \
-            -model_type uiadapter \
+            -model_type ${MODEL_TYPE} \
             > ${out_log_dir}${d_type}\/${d_index}${model_name}${out_log}
     done
 done
