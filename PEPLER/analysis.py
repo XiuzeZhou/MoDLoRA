@@ -1,4 +1,4 @@
-"""Modality correlation and full-spectrum three-branch SVD for PEPLER MoDLoRA."""
+"""Representation and weight-spectrum analysis for the current three-branch MoDLoRA."""
 
 import argparse
 import json
@@ -16,27 +16,11 @@ from module import MoDLoRA, MultiModalLoraLayer
 from utils import DataLoader, Batchify, now_time
 
 
-def select_lora_layer(model, lora_id=0, layer_id=None, module_name='q_proj'):
-    """Select by Transformer block/projection, or the legacy flattened LoRA index."""
+def select_lora_layer(model, lora_id=0):
     layers = [(name, layer) for name, layer in model.named_modules()
               if isinstance(layer, MultiModalLoraLayer)]
     if not layers:
         raise ValueError('No MultiModalLoraLayer found; use a MoDLoRA checkpoint.')
-    if layer_id is not None:
-        if layer_id < 0:
-            raise ValueError('layer_id must be nonnegative.')
-        block_path = f'.layers.{layer_id}.'
-        matches = [(name, layer) for name, layer in layers
-                   if block_path in f'.{name}' and name.rsplit('.', 1)[-1] == module_name]
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            raise ValueError(f'Multiple LoRA modules match layer_id={layer_id}, module_name={module_name}: '
-                             f'{[name for name, _ in matches]}. Use --lora_id to select one explicitly.')
-        available = [name for name, _ in layers]
-        raise ValueError(f'No LoRA module matches layers.{layer_id}.*.{module_name}. '
-                         'Check the Transformer layer number and the trained lora_modules setting. '
-                         f'Available LoRA modules (first 12 of {len(available)}): {available[:12]}')
     if not 0 <= lora_id < len(layers):
         raise ValueError(f'lora_id must be between 0 and {len(layers) - 1}, got {lora_id}.')
     return layers[lora_id]
@@ -58,8 +42,7 @@ def pairwise_correlations(first, second):
 
 
 @torch.no_grad()
-def analyze_correlation(model, test_data, device, num_batches=16, lora_id=0,
-                        output_dir=None, layer_id=None, module_name='q_proj'):
+def analyze_correlation(model, test_data, device, num_batches=16, lora_id=0):
     """Compare inputs to the selected LoRA layer, not its projected outputs.
 
     Text is the attention-masked mean of the actual layer input (prompt + review).
@@ -69,14 +52,13 @@ def analyze_correlation(model, test_data, device, num_batches=16, lora_id=0,
     """
     if num_batches <= 0:
         raise ValueError('num_batches must be positive.')
-    layer_name, layer = select_lora_layer(model, lora_id, layer_id, module_name)
+    layer_name, layer = select_lora_layer(model, lora_id)
     if not context_branches_active(layer):
         raise ValueError(f'{layer_name} skips UI/image branches because in_features != hidden_size. '
                          'Choose an active layer for correlation, or use --analysis svd.')
-    pairs = [('txt_ui', 'txt', 'ui'), ('txt_img', 'txt', 'img'), ('ui_img', 'ui', 'img')]
-    metrics = {pair: {'cos': [], 'pearson': []} for pair, _, _ in pairs}
-    original_modes = [(module, module.training) for module in model.modules()]
-    original_step = test_data.step
+    metrics = {pair: {'cos': [], 'pearson': []}
+               for pair in ('txt_ui', 'txt_img', 'ui_img')}
+    was_training, original_step = model.training, test_data.step
     original_contexts = [(m, m.x_ui, m.x_img) for m in model.modules()
                          if isinstance(m, MultiModalLoraLayer)]
     captured = {}
@@ -89,10 +71,8 @@ def analyze_correlation(model, test_data, device, num_batches=16, lora_id=0,
         # Use the supplied mask: a genuine EOS token can share the padding ID.
         mask = attention_mask.to(device=hidden.device, dtype=hidden.dtype).unsqueeze(-1)
         captured['txt'] = ((hidden * mask).sum(1) / mask.sum(1).clamp_min(1)).cpu()
-        for key, context in [('ui', layer.x_ui), ('img', layer.x_img)]:
-            if context is None or context.shape != captured['txt'].shape:
-                raise ValueError(f'{layer_name}: missing or incorrectly shaped {key} context.')
-            captured[key] = context.float().cpu()
+        captured['ui'] = layer.x_ui.float().cpu()
+        captured['img'] = layer.x_img.float().cpu()
 
     hook = layer.register_forward_pre_hook(capture_inputs)
     model.eval()
@@ -112,7 +92,9 @@ def analyze_correlation(model, test_data, device, num_batches=16, lora_id=0,
             )
             if not captured:
                 raise RuntimeError(f'The forward pass did not execute {layer_name}.')
-            for pair, first, second in pairs:
+            for pair, first, second in (('txt_ui', 'txt', 'ui'),
+                                        ('txt_img', 'txt', 'img'),
+                                        ('ui_img', 'ui', 'img')):
                 cos, pearson = pairwise_correlations(captured[first], captured[second])
                 metrics[pair]['cos'].extend(cos)
                 metrics[pair]['pearson'].extend(pearson)
@@ -121,28 +103,13 @@ def analyze_correlation(model, test_data, device, num_batches=16, lora_id=0,
         test_data.step = original_step
         for module, x_ui, x_img in original_contexts:
             module.x_ui, module.x_img = x_ui, x_img
-        for module, training in original_modes:
-            module.training = training
+        model.train(was_training)
 
-    if not metrics['txt_ui']['cos']:
-        raise ValueError('No samples were available for modality correlation.')
-    summary = {
-        pair: {'samples': len(values['cos']), 'mean_cosine': float(np.mean(values['cos'])),
-               'mean_pearson': float(np.mean(values['pearson']))}
-        for pair, values in metrics.items()
-    }
     print(f"{'Modal pair':<15} | {'Cosine':>12} | {'Pearson':>12} | {'Samples':>8}")
-    for pair, values in summary.items():
-        print(f"{pair:<15} | {values['mean_cosine']:12.4f} | "
-              f"{values['mean_pearson']:12.4f} | {values['samples']:8d}")
-    if output_dir is not None:
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, 'correlation_results.json')
-        with open(output_path, 'w', encoding='utf-8') as file:
-            json.dump({'layer': layer_name,
-                       'representation': 'layer inputs; text = masked mean over prompt + review',
-                       'metrics': metrics, 'summary': summary}, file, indent=2)
-        print(f'Correlation results saved to: {output_path}')
+    for pair, values in metrics.items():
+        if values['cos']:
+            print(f"{pair:<15} | {np.mean(values['cos']):12.4f} | "
+                  f"{np.mean(values['pearson']):12.4f} | {len(values['cos']):8d}")
     return metrics
 
 
@@ -166,7 +133,7 @@ def plot_spectra(results, keys, output_path):
         # Keep exact zeros visible on log axes; the JSON retains the raw values.
         plotted = np.maximum(values, zero_floor) if has_positive_values else values
         zeros_clipped |= has_positive_values and bool(np.any(values == 0))
-        label = rf"{key.capitalize()}_$\Delta$W"
+        label = f"{key.capitalize()}_$\Delta$W"
         if not np.any(values > 0):
             label += ' [zero matrix]'
         line, = ax.plot(np.arange(1, len(values) + 1), plotted, '.-', markersize=3, label=label)
@@ -179,7 +146,7 @@ def plot_spectra(results, keys, output_path):
                 branch_ranks = [value['rank_upper_bound'] for name, value in results.items()
                                 if name != 'fused']
                 if len(branch_ranks) > 1 and len(set(branch_ranks)) == 1 and sum(branch_ranks) == rank:
-                    rank_label = rf'$\sum r_m = {rank}$'
+                    rank_label = f'$\sum r = {rank}$'
                 else:
                     rank_label = rf'$r_{{\mathrm{{fused}}}} = {rank}$'
             ax.axvline(rank, color=line.get_color(), linestyle='--', alpha=0.6)
@@ -207,7 +174,7 @@ def plot_spectra(results, keys, output_path):
 
 @torch.no_grad()
 def analyze_svd_of_lora_weights(model, num_singular_values=128, lora_id=0,
-                               output_dir='./analysis_results', layer_id=None, module_name='q_proj'):
+                               output_dir='./analysis_results'):
     """Analyze active branch maps and their fused map on concatenated inputs.
 
     The adapter adds Dt @ x_t + Dui @ x_ui + Dimg @ x_img (column notation).
@@ -222,7 +189,7 @@ def analyze_svd_of_lora_weights(model, num_singular_values=128, lora_id=0,
     """
     if num_singular_values <= 0:
         raise ValueError('num_singular_values must be positive.')
-    layer_name, layer = select_lora_layer(model, lora_id, layer_id, module_name)
+    layer_name, layer = select_lora_layer(model, lora_id)
     os.makedirs(output_dir, exist_ok=True)
     branches = {'text': (layer.lora_A_t, layer.lora_B_t, layer.scaling)}
     if context_branches_active(layer):
@@ -279,9 +246,8 @@ def analyze_svd_of_lora_weights(model, num_singular_values=128, lora_id=0,
     plot_spectra(results, list(branches), os.path.join(output_dir, 'svd_spectrum_branches.png'))
     plot_spectra(results, ['fused'], os.path.join(output_dir, 'svd_spectrum_fused.png'))
     with open(os.path.join(output_dir, 'svd_results.json'), 'w', encoding='utf-8') as file:
-        json.dump({'layer': layer_name,
-                   'operator': '[' + ', '.join(f'Delta_W_{key}' for key in branches) + ']',
-                   'svd_method': 'dense_float32',
+        json.dump({'layer': layer_name, 'operator': '[Delta_W_text, Delta_W_ui, Delta_W_image]'
+                   if len(branches) == 3 else '[Delta_W_text]', 'svd_method': 'dense_float32',
                    'tail_note': 'Values beyond the theoretical rank are floating-point roundoff.',
                    'results': results}, file, indent=2)
     return results
@@ -323,8 +289,8 @@ def positive_int(value):
     return value
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='Analyze text/UI/image LoRA branches in PEPLER MoDLoRA')
+def main():
+    parser = argparse.ArgumentParser(description='Analyze text/UI/image LoRA branches in MoDLoRA')
     parser.add_argument('-dataset_name', '--dataset_name', default='ClothingShoesAndJewelry')
     parser.add_argument('-data_path', '--data_path', default=None)
     parser.add_argument('-index_dir', '--index_dir', default=None)
@@ -347,35 +313,17 @@ def parse_args():
     parser.set_defaults(cuda=torch.cuda.is_available())
     parser.add_argument('-num_batches', '--num_batches', type=positive_int, default=16,
                         help='maximum number of test batches used for correlation')
-    layer_group = parser.add_mutually_exclusive_group()
-    layer_group.add_argument('-lora_id', '--lora_id', default=None, type=int,
-                             help='legacy flattened LoRA index in named_modules(), not the Transformer layer number')
-    layer_group.add_argument('-layer_id', '--layer_id', default=None, type=int,
-                             help='zero-based Transformer layer number, e.g. 12 selects layers.12')
-    parser.add_argument('-module_name', '--module_name', default='q_proj',
-                        choices=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'],
-                        help='projection to analyze with --layer_id (default: q_proj); must contain trained LoRA weights')
+    parser.add_argument('-lora_id', '--lora_id', type=int, default=0,
+                        help='zero-based index in named_modules() of a MultiModalLoraLayer')
     parser.add_argument('-num_singular_values', '--num_singular_values', type=positive_int, default=10,
                         help='number of full-spectrum points to plot, including the tail beyond the rank')
-    parser.add_argument('-analysis', '--analysis', choices=['both', 'correlation', 'svd'], default='both',
-                        help='both (default): similarity + SVD; correlation: similarity only; svd: weights only')
+    parser.add_argument('-analysis', '--analysis', choices=['both', 'correlation', 'svd'], default='both')
     parser.add_argument('-output_dir', '--output_dir', default='./analysis_results')
     args = parser.parse_args()
     if args.cuda and not torch.cuda.is_available():
         parser.error('CUDA was requested but is not available.')
-    if args.lora_id is None:
-        args.lora_id = 0
     if args.lora_id < 0:
         parser.error('lora_id must be nonnegative.')
-    if args.layer_id is not None and args.layer_id < 0:
-        parser.error('layer_id must be nonnegative.')
-    if args.layer_id is None and args.module_name != 'q_proj':
-        parser.error('--module_name requires --layer_id.')
-    return args
-
-
-def main():
-    args = parse_args()
     device = torch.device('cuda' if args.cuda else 'cpu')
     model_path = resolve_checkpoint(args.checkpoint, args.dataset_name)
     data_path = args.data_path or os.path.join('../data', args.dataset_name, 'reviews.pickle')
@@ -411,18 +359,13 @@ def main():
             raise ValueError('The test split is empty; correlation requires test samples.')
         test_data = Batchify(corpus.test, corpus.user2feature, corpus.item2feature, tokenizer,
                             bos, eos, args.words, args.batch_size, corpus.max_rating, corpus.min_rating)
-        analyze_correlation(model, test_data, device, num_batches=args.num_batches,
-                            lora_id=args.lora_id, output_dir=args.output_dir,
-                            layer_id=args.layer_id, module_name=args.module_name)
+        metrics = analyze_correlation(model, test_data, device, args.num_batches, args.lora_id)
+        with open(os.path.join(args.output_dir, 'correlation_results.json'), 'w', encoding='utf-8') as file:
+            json.dump({'layer': select_lora_layer(model, args.lora_id)[0],
+                       'representation': 'layer inputs; text = masked mean over prompt + review',
+                       'metrics': metrics}, file, indent=2)
     if args.analysis in ('both', 'svd'):
-        analyze_svd_of_lora_weights(
-            model,
-            num_singular_values=args.num_singular_values,
-            lora_id=args.lora_id,
-            output_dir=args.output_dir,
-            layer_id=args.layer_id,
-            module_name=args.module_name,
-        )
+        analyze_svd_of_lora_weights(model, args.num_singular_values, args.lora_id, args.output_dir)
 
 
 if __name__ == '__main__':
