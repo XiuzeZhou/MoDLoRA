@@ -64,7 +64,7 @@ Prerequisites
 - CUDA-enabled GPU (e.g., RTX 5090)
 
 ```bash
-git clone https://github.com/XiuzeZhou/MoDLoRA.git
+git clone https://github.com/XXX/MoDLoRA.git
 cd MoDLoRA
 pip install -r requirements.txt
 ```
