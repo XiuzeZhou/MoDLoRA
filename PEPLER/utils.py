@@ -8,6 +8,7 @@ import datetime
 import json
 from rouge import rouge
 from bleu import compute_bleu
+import numpy as np
 
 
 def rouge_score(references, generated):
@@ -524,3 +525,12 @@ def ids2tokens(ids, tokenizer, eos):
             break
         tokens.append(token)
     return tokens
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
