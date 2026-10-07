@@ -402,7 +402,7 @@ def plot_spectra(results, keys, output_path):
                 branch_ranks = [value['rank_upper_bound'] for name, value in results.items()
                                 if name != 'fused']
                 if len(branch_ranks) > 1 and len(set(branch_ranks)) == 1 and sum(branch_ranks) == rank:
-                    rank_label = rf'$\sum r_m = {rank}$'
+                    rank_label = rf'$\sum r = {rank}$'
                 else:
                     rank_label = rf'$r_{{\mathrm{{fused}}}} = {rank}$'
             ax.axvline(rank, color=line.get_color(), linestyle='--', alpha=0.6)
@@ -550,7 +550,7 @@ def load_checkpoint(model, args):
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Cannot find MoDLoRA checkpoint: {ckpt_path}. "
                                 "Pass --checkpoint for an explicit .pth file. "
-                                "Three-branch analysis requires training with --use_modlora --use_multimodal.")
+                                "Three-branch analysis requires training with --lora_type modlora --use_multimodal.")
     state = load_adapter_state_dict(ckpt_path, map_location="cpu")
     # main.py saves trainable parameters only. Missing frozen backbone weights
     # and image buffers are expected; missing learned branch weights are not.
