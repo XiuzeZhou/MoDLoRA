@@ -2,16 +2,17 @@
 set -e
 
 # ==============================================================================
-# 0. Run safety checks and GPU settings: ./shell/train.sh 0
+# 0. Run safety checks and GPU settings: ./shell/train.sh 0 dora
 # ==============================================================================
 if [ -z "$1" ]; then
   echo "Error: Please enter the number of the GPU!"
-  echo "Usage: $0 <GPU_ID>"
-  echo "Example: $0 0"
+  echo "Usage: $0 <GPU_ID> [lora|modlora|dora]"
+  echo "Example: $0 0 dora"
   exit 1
 fi
 
 GPU_ID=$1
+LORA_TYPE="${2:-lora}"
 echo "Using GPU: ${GPU_ID}"
 
 
@@ -27,7 +28,7 @@ OUTPUT_DIR="./output/"
 
 
 # ==============================================================================
-# 2. Hyperparameter settings: same as the source Github
+# 2. Hyperparameter settings
 # ==============================================================================
 EPOCHS=3
 LR=1e-3
@@ -36,21 +37,20 @@ DELTA=0.2
 WORD_LEN=20
 ID_HIDDEN=1024
 BATCH_SIZE=40
-R=4
+R=12
 LORA_MODULES=2
 CKPT_DIR="./checkpoints/"
-MODEL_NAME="/root/autodl-fs/Qwen2.5-7B/" # Qwen2.5-7B, Mistral-7B-Instruct-v0.3, gemma-7b
+MODEL_NAME="/root/autodl-fs/Qwen2.5-7B/"  # Qwen2.5-7B, Mistral-7B-Instruct-v0.3, gemma-7b
 CLIP_MODEL="../llms/clip-vit-base-patch32/"
-LOG_NAME="train.log"
+LOG_NAME="train_qwen.log"
 PYTHON_EXE="/root/miniconda3/bin/python"
-USE_MoDLoRA=true
-
-ADAPTER_ARGS=()
-METHOD_NAME="CIER + image prompt"
-if [ "${USE_MoDLoRA}" = "true" ]; then
-    ADAPTER_ARGS+=(--use_modlora)
-    METHOD_NAME="MoDLoRA + image LoRA"
-fi
+ADAPTER_ARGS=(--lora_type "${LORA_TYPE}")
+case "${LORA_TYPE}" in
+    lora) METHOD_NAME="CIER + LoRA" ;;
+    modlora) METHOD_NAME="CIER + MoDLoRA" ;;
+    dora) METHOD_NAME="CIER + DoRA" ;;
+    *) echo "Invalid LORA_TYPE: ${LORA_TYPE}" >&2; exit 1 ;;
+esac
 
 
 # ==============================================================================
