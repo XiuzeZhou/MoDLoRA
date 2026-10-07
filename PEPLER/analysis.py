@@ -292,16 +292,17 @@ def positive_int(value):
 def main():
     parser = argparse.ArgumentParser(description='Analyze text/UI/image LoRA branches in MoDLoRA')
     parser.add_argument('-dataset_name', '--dataset_name', default='ClothingShoesAndJewelry')
-    parser.add_argument('-data_path', '--data_path', default=None)
+    parser.add_argument('-data_path', '--data_path',
+                        default='./data/ClothingShoesAndJewelry/reviews.pickle')
     parser.add_argument('-index_dir', '--index_dir', default=None)
-    parser.add_argument('-llm_model', '--llm_model', default='/root/autodl-fs/Qwen2.5-7B/')
-    parser.add_argument('-clip_model', '--clip_model', default='../llms/clip-vit-base-patch32/')
-    parser.add_argument('-checkpoint', '--checkpoint', default='./checkpoints/',
+    parser.add_argument('-llm_model', '--llm_model', default='./llm/Qwen2.5-7B')
+    parser.add_argument('-clip_model', '--clip_model', default='./llm/clip-vit-base-patch32/')
+    parser.add_argument('-checkpoint', '--checkpoint', default='./checkpoint/',
                         help='trained .pt file, checkpoint directory, or dataset checkpoint root')
     parser.add_argument('-batch_size', '--batch_size', type=positive_int, default=16)
     parser.add_argument('-words', '--words', type=positive_int, default=20)
-    parser.add_argument('-mlp_size', '--mlp_size', type=positive_int, default=400)
-    parser.add_argument('-k', '--k', type=positive_int, default=768)
+    parser.add_argument('-mlp_size', '--mlp_size', type=positive_int, default=300)
+    parser.add_argument('-k', '--k', type=positive_int, default=64)
     parser.add_argument('-r', '--r', type=positive_int, default=8)
     parser.add_argument('-lora_modules', '--lora_modules', type=positive_int, default=7)
     parser.add_argument('-image_dir', '--image_dir', default='images')
@@ -326,7 +327,7 @@ def main():
         parser.error('lora_id must be nonnegative.')
     device = torch.device('cuda' if args.cuda else 'cpu')
     model_path = resolve_checkpoint(args.checkpoint, args.dataset_name)
-    data_path = args.data_path or os.path.join('../data', args.dataset_name, 'reviews.pickle')
+    data_path = args.data_path
     index_dir = args.index_dir or os.path.join(os.path.dirname(data_path), '1')
 
     # Keep special-token setup identical to main.py, including non-Qwen backbones.
