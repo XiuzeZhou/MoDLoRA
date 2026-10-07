@@ -46,7 +46,9 @@ def infer_user_item_num(dataset_name):
 
 
 def model_tag_from_path(model_name):
-    return os.path.basename(os.path.normpath(model_name))
+    # Keep the cache name stable for both POSIX and Windows-style paths.
+    normalized = str(model_name).replace('\\', '/').rstrip('/')
+    return normalized.rsplit('/', 1)[-1]
 
 
 # Keep dataset preprocessing aligned with main.py; analysis-specific code starts later.
@@ -92,7 +94,16 @@ def load_or_build_dataset(args, tokenizer):
 def load_embedding_object(path):
     if path.endswith(('.pickle', '.pkl')):
         return pd.read_pickle(path)
-    return torch.load(path, map_location='cpu')
+    return load_torch_object(path, map_location='cpu')
+
+
+def load_torch_object(path, map_location='cpu'):
+    """Load tensor-only checkpoints without triggering the PyTorch warning."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        # Compatibility with PyTorch versions without the weights_only argument.
+        return torch.load(path, map_location=map_location)
 
 
 def build_item_index_mapping(args):
@@ -157,22 +168,25 @@ def build_multimodal_image_embeddings(args, item_num, device):
     dataset_dir = os.path.join(args.data_dir, args.dataset_name)
 
     if args.image_embedding_path:
-        image_embeddings = load_embedding_object(args.image_embedding_path)
-        image_embeddings = remap_image_embedding_object(image_embeddings, raw_to_idx)
-        return MoDLoRA.build_image_embedding_table(image_embeddings, item_num)
-
-    cache_dir = os.path.join(dataset_dir, 'embeddings_cache')
+        cache_path = args.image_embedding_path
+        cache_dir = os.path.dirname(cache_path) or '.'
+    else:
+        cache_dir = os.path.join(dataset_dir, 'embeddings_cache')
+        cache_path = os.path.join(cache_dir, 'item_embeddings.pt')
     os.makedirs(cache_dir, exist_ok=True)
-    cache_path = os.path.join(cache_dir, 'item_embeddings.pt')
 
     if os.path.exists(cache_path):
         print(f"Loading cached item image embeddings from {cache_path}")
-        image_embeddings = torch.load(cache_path, map_location='cpu')
+        image_embeddings = load_embedding_object(cache_path)
         image_embeddings = remap_image_embedding_object(image_embeddings, raw_to_idx)
         return MoDLoRA.build_image_embedding_table(image_embeddings, item_num)
 
     if args.clip_model is None:
-        raise ValueError("--clip_model or --image_embedding_path is required when --use_multimodal is enabled.")
+        raise FileNotFoundError(
+            f"Image embedding cache not found: {cache_path}. "
+            "Run main.py once with --clip_model and --prepare_image_embeddings_only, "
+            "or pass --clip_model to analysis.py."
+        )
 
     try:
         from PIL import Image
@@ -534,18 +548,19 @@ def build_model(args, tokenizer, user_num, item_num, image_embeddings, device):
 
 
 def load_adapter_state_dict(path, map_location="cpu"):
-    try:
-        return torch.load(path, map_location=map_location, weights_only=True)
-    except TypeError:
-        return torch.load(path, map_location=map_location)
+    return load_torch_object(path, map_location=map_location)
 
 
 def load_checkpoint(model, args):
     ckpt_path = args.checkpoint
     if ckpt_path is None:
         checkpoint_dir = os.path.join(args.ckpt_dir, args.dataset_name)
-        candidates = [os.path.join(checkpoint_dir, f'{args.split_index}{suffix}_model.pth')
-                      for suffix in ('modlora', 'uiadapter')]
+        # Current main.py writes <split>modlora_model.pth. Keep the old
+        # uiadapter name as a fallback for checkpoints created before the rename.
+        candidates = [
+            os.path.join(checkpoint_dir, f'{args.split_index}modlora_model.pth'),
+            os.path.join(checkpoint_dir, f'{args.split_index}uiadapter_model.pth'),
+        ]
         ckpt_path = next((path for path in candidates if os.path.isfile(path)), candidates[0])
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Cannot find MoDLoRA checkpoint: {ckpt_path}. "
@@ -594,23 +609,28 @@ def parse_args():
     parser.add_argument('--show_train_loss_steps', default=500, type=int)
     parser.add_argument('--id_hidden', default=1024, type=int)
     parser.add_argument('--only_eval', action='store_true')
-    parser.add_argument('--dataset_name', default='ClothingShoesAndJewelry', type=str)
-    parser.add_argument('--data_dir', default='../data/', type=str)
-    parser.add_argument('--model_name', default='/root/autodl-fs/Qwen2.5-7B/', type=str)
+    parser.add_argument('--dataset_name', default='MoviesAndTV', type=str)
+    parser.add_argument('--data_dir', default='./data/', type=str)
+    parser.add_argument('--model_name', default='../autodl-fs/Qwen2.5-7B/', type=str)
     parser.add_argument('--ckpt_dir', default='./checkpoints/', type=str)
     parser.add_argument('--checkpoint', default=None,
-                        help='explicit trained MoDLoRA .pth file; overrides ckpt_dir and split_index')
+                        help='explicit trained MoDLoRA .pth file; overrides ckpt_dir and split selection')
     parser.add_argument('--log_dir', default='./log/', type=str)
     parser.add_argument('--log_name', default='llama.log', type=str)
-    parser.add_argument('--split_index', default='1', type=str)
+    parser.add_argument('--split_indices', default=None, type=str,
+                        help='one split to analyze, using main.py syntax; e.g. 1 or 2')
+    parser.add_argument('--split_index', default=None, type=str,
+                        help='backward-compatible alias for --split_indices')
+    parser.add_argument('--lora_type', choices=['lora', 'modlora', 'dora'], default='modlora',
+                        help='analysis backend; only the custom MoDLoRA checkpoint is supported')
     parser.add_argument('--lora_modules', type=int, choices=range(1, 8), default=2)
     parser.add_argument('--r', type=positive_int, default=4)
     modality_group = parser.add_mutually_exclusive_group()
     modality_group.add_argument('--use_multimodal', dest='use_multimodal', action='store_true',
-                                help='analyze text/UI/image branches (default)')
+                                help='analyze the image branch in addition to text/UI')
     modality_group.add_argument('--no_multimodal', dest='use_multimodal', action='store_false',
                                 help='analyze a legacy text/UI checkpoint without image LoRA')
-    parser.set_defaults(use_multimodal=True)
+    parser.set_defaults(use_multimodal=False)
     parser.add_argument('--clip_model', default=None, type=str)
     parser.add_argument('--image_dir', default='images', type=str)
     parser.add_argument('--image_embedding_path', default=None, type=str)
@@ -632,6 +652,17 @@ def parse_args():
                         help='both (default): similarity + SVD; correlation: similarity only; svd: weights only')
     parser.add_argument('--output_dir', default='./analysis_results', type=str)
     args = parser.parse_args()
+    if args.split_indices is not None and args.split_index is not None:
+        parser.error('Use only one of --split_indices and --split_index.')
+    if args.lora_type != 'modlora':
+        parser.error('analysis.py currently supports only --lora_type modlora; '
+                     'PEFT LoRA/DoRA checkpoints do not contain the CIER modality branches.')
+    requested_split = args.split_indices if args.split_indices is not None else args.split_index
+    requested_split = '1' if requested_split is None else str(requested_split)
+    split_values = [value.strip() for value in requested_split.split(',') if value.strip()]
+    if len(split_values) != 1:
+        parser.error('analysis.py analyzes one checkpoint at a time; pass one split, e.g. --split_indices 2.')
+    args.split_index = split_values[0]
     if args.lora_id is None:
         args.lora_id = 0
     if args.lora_id < 0:
