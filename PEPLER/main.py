@@ -6,7 +6,7 @@ from torch.optim import AdamW
 from transformers import AutoTokenizer
 from module import MoDLoRA, Concat_LoRA  
 from utils import rouge_score, bleu_score, DataLoader, Batchify, now_time, ids2tokens, unique_sentence_percent, \
-    root_mean_square_error, mean_absolute_error, feature_detect, feature_matching_ratio, feature_coverage_ratio, feature_diversity
+    root_mean_square_error, mean_absolute_error, feature_detect, feature_matching_ratio, feature_coverage_ratio, feature_diversity, set_seed
 
 
 parser = argparse.ArgumentParser(description='User-Item Adapter for LLM-based Explainable Recommendation Systems (MoDLoRA)')
@@ -18,7 +18,7 @@ parser.add_argument('-llm_model', '--llm_model', type=str, default="./llm/Qwen2.
                     help='LLM backbone')
 parser.add_argument('-clip_model', '--clip_model', type=str, default="./llm/clip-vit-base-patch32/",
                     help='CLIP model path used to generate item image embeddings')
-parser.add_argument('-model_type', '--model_type', type=str, default="lora", choices=['modlora', 'lora'],
+parser.add_argument('-model_type', '--model_type', type=str, default="lora", choices=['modlora', 'lora', 'dora'],
                     help='model architecture pipeline: multimodal ui/image LoRA or multimodal concat')
 parser.add_argument('-lr', '--lr', type=float, default=1e-7,
                     help='learning rate for the model')
@@ -83,6 +83,8 @@ if not os.path.exists(args.checkpoint):
 model_path = os.path.join(args.checkpoint, 'model.pt')
 prediction_path = args.outf
 
+set_seed(args.seed)
+
 ###############################################################################
 # Load data
 ###############################################################################
@@ -102,7 +104,7 @@ tokenizer.pad_token = pad  # Ensure pad_token is set consistently
 tokenizer.add_special_tokens({'bos_token': bos, 'eos_token': eos, 'pad_token': pad})
 corpus = DataLoader(
     args.data_path, args.index_dir, tokenizer, args.words,
-    clip_path=args.clip_model if args.model_type in ['modlora', 'lora'] else None,
+    clip_path=args.clip_model if args.model_type in ['modlora', 'lora', 'dora'] else None,
     image_dir=args.image_dir,
     device=device
 )
@@ -110,30 +112,50 @@ feature_set = corpus.feature_set
 
 train_data = Batchify(corpus.train, corpus.user2feature, corpus.item2feature, tokenizer, bos, eos, args.words, args.batch_size, corpus.max_rating, corpus.min_rating, shuffle=True)
 val_data = Batchify(corpus.valid, corpus.user2feature, corpus.item2feature, tokenizer, bos, eos, args.words, args.batch_size, corpus.max_rating, corpus.min_rating)
-test_data = Batchify(corpus.test, corpus.user2feature, corpus.item2feature, tokenizer, bos, eos, args.words, args.batch_size*4, corpus.max_rating, corpus.min_rating)
+test_data = Batchify(corpus.test, corpus.user2feature, corpus.item2feature, tokenizer, bos, eos, args.words, args.batch_size*8, corpus.max_rating, corpus.min_rating)
 
 ###############################################################################
 # Build the model
 ###############################################################################
 
-if args.model_type == 'modlora':
-    model = MoDLoRA.from_pretrained(
-        args.llm_model, len(corpus.user_dict), len(corpus.item_dict),
-        args.k, args.r, args.mlp_size, args.lora_modules,
-        image_embeddings=corpus.image_embeddings,
-        ui_multimodal_scale=args.ui_multimodal_scale,
-        image_multimodal_scale=args.image_multimodal_scale
-    )
-else:
-    model = Concat_LoRA.from_pretrained(
-        args.llm_model, len(corpus.user_dict), len(corpus.item_dict),
-        args.k, args.r, args.mlp_size, args.lora_modules,
-        image_embeddings=corpus.image_embeddings
-    )
+def build_model():
+    if args.model_type == 'modlora':
+        return MoDLoRA.from_pretrained(
+            args.llm_model,
+            len(corpus.user_dict),
+            len(corpus.item_dict),
+            args.k,
+            args.r,
+            args.mlp_size,
+            args.lora_modules,
+            image_embeddings=corpus.image_embeddings,
+            ui_multimodal_scale=args.ui_multimodal_scale,
+            image_multimodal_scale=args.image_multimodal_scale
+        )
 
+    elif args.model_type in ['lora', 'dora']:
+        return Concat_LoRA.from_pretrained(
+            args.llm_model,
+            len(corpus.user_dict),
+            len(corpus.item_dict),
+            args.k,
+            args.r,
+            args.mlp_size,
+            args.lora_modules,
+            image_embeddings=corpus.image_embeddings,
+            is_dora=(args.model_type == 'dora')
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown model_type: {args.model_type}"
+        )
+
+model = build_model()
 model.resize_token_embeddings(len(tokenizer))
 model.to(device)
-optimizer = AdamW(model.parameters(), lr=args.lr)
+#optimizer = AdamW(model.parameters(), lr=args.lr)
+optimizer = AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr)
 
 ###############################################################################
 # Training code
@@ -249,12 +271,23 @@ def generate(data):
             )  # Greedy decoding; adjust for beam search if needed
             
             generated_ids = generated_output.sequences
+
             if args.model_type == 'modlora':
+                # MoDLoRA passes input_ids directly into model.generate(),
+                # so returned sequences contain input tokens + generated tokens.
                 ids = generated_ids[:, input_size:].tolist()
+            
+            elif args.model_type in ['lora', 'dora']:
+                # Concat_LoRA / DoRA use inputs_embeds for multimodal prefixing.
+                # In the current generation pipeline, returned sequences contain
+                # only newly generated token IDs.
+                ids = generated_ids.tolist()
+            
             else:
-                # Concat_LoRA injects [u, i, x_img] through inputs_embeds, so those virtual tokens
-                # are not present in generated_output.sequences.
-                ids = generated_ids[:, 1:].tolist()
+                raise ValueError(
+                    f"Unsupported model_type: {args.model_type}"
+                )
+            
             idss_predict.extend(ids)
 
             # --- Rating Prediction ---
@@ -304,12 +337,13 @@ for epoch in range(1, args.epochs + 1):
 ###############################################################################
 from rating_prediction import train_rating_predictor
 
-#model.load_state_dict(torch.load(model_path, map_location=device))
+best_state = torch.load(model_path, map_location=device)
+model.load_state_dict(best_state, strict=False)
+print(now_time() +
+    'Loaded best validation checkpoint '
+    'before rating predictor training'
+)
 train_rating_predictor(model, train_data, test_data, val_data, model_path, lr=1e-4, max_rating=corpus.max_rating, min_rating=corpus.min_rating, device=device)
-if args.model_type in ['lora', 'modlora']:
-    train_rating_predictor(model, train_data, test_data, val_data, model_path, lr=1e-4, max_rating=corpus.max_rating, min_rating=corpus.min_rating, device=device)
-else:
-    print(now_time() + " CIER uses LLM for rating prediction. Skipping separate rating predictor training.")
 
 ###############################################################################
 # Evaluate
@@ -331,21 +365,7 @@ print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 print(f"GPU memory cached: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
 # Load the best saved model.
-if args.model_type == 'modlora':
-    model = MoDLoRA.from_pretrained(
-        args.llm_model, len(corpus.user_dict), len(corpus.item_dict),
-        args.k, args.r, args.mlp_size, args.lora_modules,
-        image_embeddings=corpus.image_embeddings,
-        ui_multimodal_scale=args.ui_multimodal_scale,
-        image_multimodal_scale=args.image_multimodal_scale
-    )
-else:
-    model = Concat_LoRA.from_pretrained(
-        args.llm_model, len(corpus.user_dict), len(corpus.item_dict),
-        args.k, args.r, args.mlp_size, args.lora_modules,
-        image_embeddings=corpus.image_embeddings
-    )
-
+model = build_model()
 model.resize_token_embeddings(len(tokenizer))
 loaded_state = torch.load(model_path, map_location=device)
 model.load_state_dict(loaded_state, strict=False)
