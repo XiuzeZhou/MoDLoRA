@@ -6,6 +6,7 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 import re
+from inspect import signature
 from tqdm import tqdm
 from torch.optim import *
 # from typing import Optional, Callable, Any, Tuple
@@ -162,9 +163,9 @@ def build_multimodal_image_embeddings(args, item_num, device):
 
     return MyModel.build_image_embedding_table(item_embeddings, item_num)
 
-def configure_gradient_checkpointing(model_llm, use_modlora):
+def configure_gradient_checkpointing(model_llm, lora_type):
     model_llm.config.use_cache = False
-    if use_modlora:
+    if lora_type == 'modlora':
         try:
             model_llm.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -367,12 +368,10 @@ def test_step(model, test_dataloader, device, log_name,
     
     
 def main(args):
-    if not os.path.exists(args.ckpt_dir + args.dataset_name):
-        os.makedirs(args.ckpt_dir + args.dataset_name)
-    if not os.path.exists(args.output_dir + args.dataset_name):
-        os.makedirs(args.output_dir + args.dataset_name)
-    if not os.path.exists(args.log_dir + args.dataset_name):
-        os.makedirs(args.log_dir + args.dataset_name)
+    if args.lora_type == 'dora' and 'use_dora' not in signature(LoraConfig).parameters:
+        raise RuntimeError('DoRA requires peft>=0.9.0; upgrade PEFT before using --lora_type dora.')
+    for root_dir in (args.ckpt_dir, args.output_dir, args.log_dir):
+        os.makedirs(os.path.join(root_dir, args.dataset_name), exist_ok=True)
     seed_everything(args.seed)
     device = 0
     # device = 'cpu'
@@ -431,6 +430,12 @@ def main(args):
         return
     for split_index in parse_split_indices(args.split_indices):
         print(f"========== split_index: {split_index} ==========")
+        checkpoint_dir = os.path.join(args.ckpt_dir, args.dataset_name)
+        adapter_ckpt_path = os.path.join(checkpoint_dir, f'{split_index}modlora_model.pth')
+        peft_prefix = f'{split_index}dora_' if args.lora_type == 'dora' else split_index
+        peft_adapter_dir = os.path.join(checkpoint_dir, f'{peft_prefix}model')
+        prompt_encoder_path = os.path.join(checkpoint_dir, f'{peft_prefix}ped.bin')
+        prompt_image_path = os.path.join(checkpoint_dir, f'{peft_prefix}prompt_img.bin')
     #for split_index in ['1']:
         train_dataset, valid_dataset, test_dataset = dataset_split(dataset,split_index,args)
         train_set = MyDataset(train_dataset)
@@ -442,21 +447,12 @@ def main(args):
         valid_dataloader = DataLoader(valid_set, batch_size=args.batch_size, collate_fn=collate_valid, shuffle=False)
         test_dataloader = DataLoader(test_set, batch_size=args.batch_size, collate_fn=collate_valid, shuffle=False)
 
-        # Define LoRA Config
-        lora_config = LoraConfig(
-         r=args.r,
-         lora_alpha=32,
-         target_modules=target_modules,
-         lora_dropout=0.05,
-         bias="none",
-         task_type=TaskType.CAUSAL_LM
-        )
         model_llm = AutoModelForCausalLM.from_pretrained(
                     args.model_name, torch_dtype=torch.bfloat16, device_map='cuda:'+str(device)
         )
-        configure_gradient_checkpointing(model_llm, args.use_modlora)
+        configure_gradient_checkpointing(model_llm, args.lora_type)
 
-        if args.use_modlora:
+        if args.lora_type == 'modlora':
             model = MoDLoRA(user_num=user_num, 
                              item_num=item_num, 
                              hidden=args.id_hidden, 
@@ -470,6 +466,17 @@ def main(args):
                              image_multimodal_scale=args.image_multimodal_scale).to(device)
         else:
             # Original Method，using PEFT
+            lora_kwargs = dict(
+                r=args.r,
+                lora_alpha=32,
+                target_modules=target_modules,
+                lora_dropout=0.05,
+                bias="none",
+                task_type=TaskType.CAUSAL_LM,
+            )
+            if args.lora_type == 'dora':
+                lora_kwargs['use_dora'] = True
+            lora_config = LoraConfig(**lora_kwargs)
             model_llm = get_peft_model(model_llm, lora_config)
             model_llm.print_trainable_parameters()
             model = MyModel(
@@ -488,7 +495,7 @@ def main(args):
         param = list(filter(lambda p: p.requires_grad==True, model.prompt_encoder.parameters()))
         if getattr(model, "f_prompt_img", None) is not None:
             param += list(filter(lambda p: p.requires_grad==True, model.f_prompt_img.parameters()))
-        if args.use_modlora:
+        if args.lora_type == 'modlora':
             param += list(filter(lambda p: p.requires_grad==True, model.f_ui.parameters()))
             if getattr(model, "f_img", None) is not None:
                 param += list(filter(lambda p: p.requires_grad==True, model.f_img.parameters()))
@@ -499,8 +506,9 @@ def main(args):
              {'params': param2, 'lr': args.learning_rate/10},
         ])
 
-        log_name = args.log_dir + args.dataset_name+'/' + args.log_name
-        output_dir = args.output_dir+ args.dataset_name+'/'+split_index+'generate.dataset'
+        log_name = os.path.join(args.log_dir, args.dataset_name, f'{args.lora_type}_{args.log_name}')
+        output_dir = os.path.join(args.output_dir, args.dataset_name,
+                                  f'{split_index}{args.lora_type}_generate.dataset')
         f = open(log_name,'a+')
         f.write(args.model_name+"\n")
         f.write("                                 split_index:" +split_index+"\n")
@@ -529,36 +537,34 @@ def main(args):
                     f.write("save model\n")
                     best_loss = valid_loss
                     
-                    if args.use_modlora:
-                        adapter_ckpt_path = args.ckpt_dir + args.dataset_name + '/' + split_index + 'modlora_model.pth'
+                    if args.lora_type == 'modlora':
                         trainable_params = {k: v.detach().cpu() for k, v in model.named_parameters() if v.requires_grad}
                         torch.save(trainable_params, adapter_ckpt_path)
                     else:
-                        model.model.save_pretrained(args.ckpt_dir + args.dataset_name + '/'+split_index+'model')
-                        torch.save(model.prompt_encoder,args.ckpt_dir + args.dataset_name + '/'+split_index+'ped.bin')
+                        model.model.save_pretrained(peft_adapter_dir)
+                        torch.save(model.prompt_encoder, prompt_encoder_path)
                         if getattr(model, "f_prompt_img", None) is not None:
                             torch.save(
                                 model.f_prompt_img.state_dict(),
-                                args.ckpt_dir + args.dataset_name + '/' + split_index + 'prompt_img.bin'
+                                prompt_image_path
                             )
                 f.close()
                 if early_stop == 0:
                     break
 
-        if args.use_modlora:
-            adapter_ckpt_path = args.ckpt_dir + args.dataset_name + '/' + split_index + 'modlora_model.pth'
+        if args.lora_type == 'modlora':
             torch.cuda.empty_cache()
             model.load_state_dict(load_adapter_state_dict(adapter_ckpt_path, map_location="cpu"), strict=False)
         else:
-            model.model.load_adapter(args.ckpt_dir + args.dataset_name + '/'+split_index+'model', 'best_lora')
-            model.model.set_adapter("best_lora")
-            model.prompt_encoder = torch.load(args.ckpt_dir + args.dataset_name + '/'+split_index+'ped.bin', map_location="cuda:"+str(device), weights_only=False)
-            prompt_img_path = args.ckpt_dir + args.dataset_name + '/' + split_index + 'prompt_img.bin'
+            adapter_name = f'best_{args.lora_type}'
+            model.model.load_adapter(peft_adapter_dir, adapter_name)
+            model.model.set_adapter(adapter_name)
+            model.prompt_encoder = torch.load(prompt_encoder_path, map_location="cuda:"+str(device), weights_only=False)
             if getattr(model, "f_prompt_img", None) is not None:
-                if os.path.exists(prompt_img_path):
-                    model.f_prompt_img.load_state_dict(load_torch_object(prompt_img_path, map_location="cpu"))
+                if os.path.exists(prompt_image_path):
+                    model.f_prompt_img.load_state_dict(load_torch_object(prompt_image_path, map_location="cpu"))
                 else:
-                    print(f"Warning: prompt image projector checkpoint not found: {prompt_img_path}")
+                    print(f"Warning: prompt image projector checkpoint not found: {prompt_image_path}")
             
         test_step(model, test_dataloader, device, log_name, test_set, output_dir, args.word, tokenizer)
         del model, model_llm, optimizer
@@ -601,7 +607,8 @@ if __name__ == '__main__':
     parser.add_argument('--log_dir', default='./log/', type=str)
     parser.add_argument('--log_name', default='llama.log', type=str)
     parser.add_argument('--output_dir', default='./output/', type=str)
-    parser.add_argument('--use_modlora', action='store_true', help='Use MoDLoRA architecture')
+    parser.add_argument('--lora_type', choices=['lora', 'modlora', 'dora'], default='lora',
+                        help='fine-tuning method: PEFT LoRA, custom MoDLoRA, or PEFT DoRA')
     parser.add_argument('--lora_modules', '--lora_modules', type=int, default=2, help='number of modules for LoRA')
     parser.add_argument('--r', '--r', type=int, default=4, help='rank for LoRA')
     parser.add_argument('--use_multimodal', action='store_true', help='Enable item-image features for CIER/MoDLoRA')
