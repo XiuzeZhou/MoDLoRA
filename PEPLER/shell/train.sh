@@ -43,6 +43,7 @@ MLP_SIZE=400
 UI_SCALING=2.0
 IMAGE_SCALING=2.0
 ACC_STEPS=1
+PYTHON_EXE="/root/miniconda3/bin/python"
 
 for d_type in ClothingShoesAndJewelry MoviesAndTV
 do
@@ -57,7 +58,7 @@ do
         echo "GPU: ${GPU_ID}, model: ${MODEL_TYPE}, dataset: ${d_type}/${d_index}, seed: ${SEED}, lora_modules: ${LoRA_MODULES}, rank: ${RANK}"
         TRANSFORMERS_CACHE=../llms/ \
         HF_DATASETS_CACHE=../llms/ \
-        CUDA_VISIBLE_DEVICES="$GPU_ID" python -u ./main.py \
+        CUDA_VISIBLE_DEVICES="$GPU_ID" "${PYTHON_EXE}" -u ./main.py \
             -data_path "${data_root}/${d_type}/reviews.pickle" \
             -index_dir "${data_root}/${d_type}/${d_index}/" \
             -llm_model "$LLM_MODEL" \
