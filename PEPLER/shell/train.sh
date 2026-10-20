@@ -8,12 +8,12 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 GPU_ID="${1:-0}"
-MODEL_TYPE="${2:-modlora}"
+LORA_TYPE="${2:-modlora}"
 
-case "$MODEL_TYPE" in
+case "$LORA_TYPE" in
     modlora|moddora|modadalora|lora|dora|adalora) ;;
     *)
-        echo "Error: unsupported model type '$MODEL_TYPE'. Choose modlora, moddora, modadalora, lora, dora, or adalora." >&2
+        echo "Error: unsupported model type '$LORA_TYPE'. Choose modlora, moddora, modadalora, lora, dora, or adalora." >&2
         exit 2
         ;;
 esac
@@ -26,34 +26,37 @@ SEED=111
 MOD_RANK=8
 BASE_RANK=$((3 * MOD_RANK))
 ADALORA_INIT_FACTOR=3
-case "$MODEL_TYPE" in
+case "$LORA_TYPE" in
     lora|dora|adalora) RANK="$BASE_RANK" ;;
     modlora|moddora|modadalora) RANK="$MOD_RANK" ;;
 esac
-if [[ "$MODEL_TYPE" == "adalora" ]]; then
-    ADALORA_TARGET_R="$BASE_RANK"
-else
-    ADALORA_TARGET_R="$MOD_RANK"
-fi
+ADALORA_TARGET_R="$RANK"
 ADALORA_INIT_R=$((ADALORA_INIT_FACTOR * ADALORA_TARGET_R))
 ADALORA_TINIT=0
 ADALORA_TFINAL=0
 ADALORA_DELTA_T=1
 ADALORA_ORTH_REG_WEIGHT=0.5
-if [[ "$MODEL_TYPE" == "adalora" || "$MODEL_TYPE" == "modadalora" ]]; then
-    model_name="${MODEL_TYPE}_llama_init-${ADALORA_INIT_R}_target-${ADALORA_TARGET_R}"
+LLM_MODEL=/root/autodl-fs/Qwen2.5-7B/
+case "${LLM_MODEL,,}" in
+    *qwen*) model_family=qwen ;;
+    *mistral*) model_family=mistral ;;
+    *gemma*) model_family=gemma ;;
+    *llama*) model_family=llama ;;
+    *) echo "Error: cannot determine log name from LLM_MODEL: ${LLM_MODEL}" >&2; exit 1 ;;
+esac
+if [[ "$LORA_TYPE" == "adalora" || "$LORA_TYPE" == "modadalora" ]]; then
+    model_name="${LORA_TYPE}_${model_family}_init-${ADALORA_INIT_R}_target-${ADALORA_TARGET_R}"
 else
-    model_name="${MODEL_TYPE}_llama_rank-${RANK}"
+    model_name="${LORA_TYPE}_${model_family}_rank-${RANK}"
 fi
 data_root=../data
-LLM_MODEL=/root/autodl-fs/Qwen2.5-7B/
 CLIP_MODEL=../llms/clip-vit-base-patch32/
 checkpoint_root=./checkpoints
 out_file_root=./outputs
 out_log_root=./logs
 out_file_name=generated.txt
-out_log_name=train.log
-case "$MODEL_TYPE" in
+out_log_name="${LORA_TYPE}_train_${model_family}_${RANK}.log"
+case "$LORA_TYPE" in
     lora|modlora) LR=2e-7 ;;
     dora|moddora|adalora|modadalora) LR=2e-5 ;;
 esac
@@ -74,9 +77,10 @@ for d_type in ClothingShoesAndJewelry MoviesAndTV; do
         log_dir="${out_log_root}/${d_type}/${run_name}"
         output_dir="${out_file_root}/${d_type}/${run_name}"
         checkpoint_dir="${checkpoint_root}/${d_type}/${model_name}"
+        log_path="${log_dir}/${out_log_name}"
         mkdir -p "$log_dir" "$output_dir" "$checkpoint_dir"
 
-        echo "GPU: ${GPU_ID}, model: ${MODEL_TYPE}, dataset: ${d_type}/${d_index}, seed: ${SEED}, lr: ${LR}, lora_modules: ${LoRA_MODULES}, run: ${model_name}"
+        echo "GPU: ${GPU_ID}, model: ${LORA_TYPE}, dataset: ${d_type}/${d_index}, seed: ${SEED}, lr: ${LR}, lora_modules: ${LoRA_MODULES}, run: ${model_name}, log: ${log_path}"
         TRANSFORMERS_CACHE=../llms/ \
         HF_DATASETS_CACHE=../llms/ \
         CUDA_VISIBLE_DEVICES="$GPU_ID" "${PYTHON_EXE}" -u ./main.py \
@@ -107,7 +111,7 @@ for d_type in ClothingShoesAndJewelry MoviesAndTV; do
             -checkpoint "$checkpoint_dir" \
             -outf "${output_dir}/${out_file_name}" \
             -words 20 \
-            -model_type "$MODEL_TYPE" \
-            > "${log_dir}/${out_log_name}" 2>&1
+            -model_type "$LORA_TYPE" \
+            > "$log_path" 2>&1
     done
 done
