@@ -328,7 +328,143 @@ class MultiModalLoraLayer(nn.Module):
         return self.base_layer(x) + lora_t + lora_ui + lora_img
 
 
+class MultiModalDoRALayer(MultiModalLoraLayer):
+    """Apply one DoRA magnitude to the text, user-item and optional image directions."""
+
+    def __init__(self, base_layer, hidden_size=4096, dtype=torch.bfloat16, **kwargs):
+        eps = kwargs.pop("dora_eps", 1e-6)
+        super().__init__(base_layer, hidden_size=hidden_size, dtype=dtype, **kwargs)
+        self.eps = eps
+        with torch.no_grad():
+            magnitude = torch.linalg.vector_norm(
+                base_layer.weight.float(), ord=2, dim=1
+            ).clamp_min(self.eps)
+        self.dora_magnitude = nn.Parameter(magnitude)
+
+    @torch.no_grad()
+    def _compute_weight_norm(self):
+        # The three directions act on separate inputs. Their squared row norms
+        # add without cross terms in the augmented direction matrix.
+        direction = (
+            self.base_layer.weight.float()
+            + self.scaling * (self.lora_B_t.float() @ self.lora_A_t.float())
+        )
+        squared_norm = direction.square().sum(dim=1)
+        if self.base_layer.in_features == self.hidden_size:
+            ui_direction = (
+                self.scaling * self.ui_multimodal_scaling.float()
+                * (self.lora_B_ui.float() @ self.lora_A_ui.float())
+            )
+            squared_norm += ui_direction.square().sum(dim=1)
+            if self.use_image_lora:
+                image_direction = (
+                    self.scaling * self.image_multimodal_scaling.float()
+                    * (self.lora_B_img.float() @ self.lora_A_img.float())
+                )
+                squared_norm += image_direction.square().sum(dim=1)
+        return squared_norm.clamp_min(self.eps ** 2).sqrt()
+
+    def forward(self, x):
+        base_result = self.base_layer(x)
+        lora_t = (
+            self.lora_dropout(x)
+            @ self.lora_A_t.transpose(0, 1).to(x.dtype)
+            @ self.lora_B_t.transpose(0, 1).to(x.dtype)
+            * self.scaling
+        )
+        lora_ui = self._context_lora(
+            self.x_ui, self.lora_A_ui, self.lora_B_ui, x, self.ui_multimodal_scaling
+        )
+        lora_img = 0
+        if self.use_image_lora:
+            lora_img = self._context_lora(
+                self.x_img, self.lora_A_img, self.lora_B_img, x,
+                self.image_multimodal_scaling,
+            )
+
+        magnitude_scale = (self.dora_magnitude / self._compute_weight_norm()).to(
+            device=base_result.device, dtype=base_result.dtype
+        )
+        magnitude_scale = magnitude_scale.view(
+            *([1] * (base_result.dim() - 1)), self.base_layer.out_features
+        )
+        base_no_bias = base_result
+        if self.base_layer.bias is not None:
+            bias = self.base_layer.bias.to(
+                device=base_result.device, dtype=base_result.dtype
+            )
+            base_no_bias = base_result - bias.view(
+                *([1] * (base_result.dim() - 1)), self.base_layer.out_features
+            )
+        return (
+            base_result
+            + (magnitude_scale - 1.0) * base_no_bias
+            + magnitude_scale * (lora_t + lora_ui + lora_img).to(base_result.dtype)
+        )
+
+
+class MultiModalAdaLoraLayer(MultiModalLoraLayer):
+    """SVD adapters for text, user-item and optional image inputs."""
+
+    def __init__(self, base_layer, hidden_size=4096, dtype=torch.bfloat16, **kwargs):
+        super().__init__(base_layer, hidden_size=hidden_size, dtype=dtype, **kwargs)
+        self.branches = ['t']
+        if base_layer.in_features == hidden_size:
+            self.branches.append('ui')
+            if self.use_image_lora:
+                self.branches.append('img')
+
+        for branch in ('t', 'ui', 'img'):
+            lora_a = getattr(self, f'lora_A_{branch}', None)
+            if lora_a is None:
+                continue
+            lora_b = getattr(self, f'lora_B_{branch}')
+            if branch not in self.branches:
+                lora_a.requires_grad_(False)
+                lora_b.requires_grad_(False)
+                continue
+            nn.init.normal_(lora_a, std=0.02)
+            nn.init.normal_(lora_b, std=0.02)
+            setattr(self, f'lora_E_{branch}', nn.Parameter(
+                torch.zeros(lora_a.size(0), 1, device=lora_a.device, dtype=torch.float32)
+            ))
+
+    def _svd_update(self, inputs, branch):
+        lora_a = getattr(self, f'lora_A_{branch}')
+        lora_b = getattr(self, f'lora_B_{branch}')
+        lora_e = getattr(self, f'lora_E_{branch}')
+        return (
+            self.lora_dropout(inputs)
+            @ (lora_a.to(inputs.dtype) * lora_e.to(inputs.dtype)).transpose(0, 1)
+            @ lora_b.transpose(0, 1).to(inputs.dtype)
+            * self.scaling
+        )
+
+    def _context_update(self, context, branch, x, modality_scaling):
+        if context is None or branch not in self.branches:
+            return 0
+        current_context = self._align_context(context, x.size(0))
+        if current_context is None:
+            return 0
+        current_context = current_context.to(device=x.device, dtype=x.dtype).unsqueeze(1)
+        return self._svd_update(current_context, branch) * modality_scaling.to(x.dtype)
+
+    def forward(self, x):
+        result = self.base_layer(x) + self._svd_update(x, 't')
+        result = result + self._context_update(
+            self.x_ui, 'ui', x, self.ui_multimodal_scaling
+        )
+        if self.use_image_lora:
+            result = result + self._context_update(
+                self.x_img, 'img', x, self.image_multimodal_scaling
+            )
+        return result
+
+
 class MoDLoRA(MyModel):
+    use_dora = False
+    use_adalora = False
+
     def __init__(self, user_num, item_num, hidden, llm_hidden, tokenizer, model_llm, r=8, lora_alpha=32, lora_modules=2, image_embeddings=None, ui_multimodal_scale=1.0, image_multimodal_scale=1.0):
         super().__init__(user_num, item_num, hidden, llm_hidden, tokenizer)
         self.model = model_llm  # base LLM
@@ -354,7 +490,11 @@ class MoDLoRA(MyModel):
             
         for name, module in self.model.named_modules():
             if any(t_name in name for t_name in target_modules) and isinstance(module, nn.Linear):
-                new_layer = MultiModalLoraLayer(
+                if self.use_adalora:
+                    adapter_layer = MultiModalAdaLoraLayer
+                else:
+                    adapter_layer = MultiModalDoRALayer if self.use_dora else MultiModalLoraLayer
+                new_layer = adapter_layer(
                     base_layer=module, dtype=model_llm.dtype, r=r, lora_alpha=lora_alpha, 
                     hidden_size=llm_hidden,
                     use_image_lora=self.use_image_lora,
@@ -432,3 +572,89 @@ class MoDLoRA(MyModel):
                 mod.x_img = x_img
         
         return super().get_embedding(input_ids, user_id, item_id, rating, curr_flag)
+
+
+class MoDDoRA(MoDLoRA):
+    """CIER with modality-decomposed DoRA adapters."""
+
+    use_dora = True
+
+
+class MoDAdaLoRA(MoDLoRA):
+    """CIER with a shared adaptive rank budget across modality adapters."""
+
+    use_adalora = True
+
+
+class MoDAdaLoRARankAllocator:
+    """Allocate AdaLoRA singular triplets across all active modality branches."""
+
+    def __init__(self, model, init_r, target_r, total_step, tinit=0, tfinal=0,
+                 delta_t=1, beta1=0.85, beta2=0.85):
+        if not 0 < target_r < init_r:
+            raise ValueError('AdaLoRA requires 0 < target_r < init_r.')
+        if total_step <= 0 or tinit < 0 or tfinal < 0 or tinit + tfinal >= total_step:
+            raise ValueError('AdaLoRA requires total_step > tinit + tfinal >= 0.')
+        if delta_t <= 0:
+            raise ValueError('AdaLoRA delta_t must be positive.')
+        self.factors = []
+        for layer in model.modules():
+            if isinstance(layer, MultiModalAdaLoraLayer):
+                for branch in layer.branches:
+                    self.factors.append(tuple(getattr(layer, f'lora_{part}_{branch}')
+                                              for part in ('A', 'B', 'E')))
+        if not self.factors:
+            raise ValueError('No MoDAdaLoRA projection layers were found.')
+        self.init_budget = init_r * len(self.factors)
+        self.target_budget = target_r * len(self.factors)
+        self.total_step = total_step
+        self.tinit = tinit
+        self.tfinal = tfinal
+        self.delta_t = delta_t
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.smoothed = [torch.zeros(init_r, device=e.device) for _, _, e in self.factors]
+        self.uncertainty = [torch.zeros(init_r, device=e.device) for _, _, e in self.factors]
+        self.final_masks = None
+
+    @torch.no_grad()
+    def update_and_allocate(self, step):
+        if step > self.total_step:
+            raise ValueError('AdaLoRA optimizer step exceeds total_step.')
+        scores = []
+        for index, (lora_a, lora_b, lora_e) in enumerate(self.factors):
+            if any(parameter.grad is None for parameter in (lora_a, lora_b, lora_e)):
+                importance = torch.zeros_like(self.smoothed[index])
+            else:
+                importance = (
+                    (lora_a.float() * lora_a.grad.float()).abs().mean(dim=1)
+                    + (lora_b.float() * lora_b.grad.float()).abs().mean(dim=0)
+                    + (lora_e.float() * lora_e.grad.float()).abs().view(-1)
+                )
+            self.smoothed[index].mul_(self.beta1).add_(importance, alpha=1 - self.beta1)
+            self.uncertainty[index].mul_(self.beta2).add_(
+                (importance - self.smoothed[index]).abs(), alpha=1 - self.beta2
+            )
+            scores.append(self.smoothed[index] * self.uncertainty[index])
+
+        if step <= self.tinit:
+            return
+        final_step = self.total_step - self.tfinal
+        if step >= final_step and self.final_masks is not None:
+            masks = self.final_masks
+        else:
+            progress = min(1.0, (step - self.tinit) / (final_step - self.tinit))
+            budget = int((self.init_budget - self.target_budget) * (1 - progress) ** 3
+                         + self.target_budget)
+            if step < final_step and step % self.delta_t:
+                return
+            flat_scores = torch.cat(scores)
+            selected = flat_scores.topk(budget).indices
+            flat_mask = torch.zeros_like(flat_scores, dtype=torch.bool)
+            flat_mask[selected] = True
+            masks = flat_mask.split([lora_e.numel() for _, _, lora_e in self.factors])
+            if step >= final_step:
+                self.final_masks = masks
+
+        for (_, _, lora_e), mask in zip(self.factors, masks):
+            lora_e.masked_fill_(~mask.view(-1, 1), 0.0)
