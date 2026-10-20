@@ -4,7 +4,8 @@ import torch
 import argparse
 from torch.optim import AdamW
 from transformers import AutoTokenizer
-from module import MoDLoRA, Concat_LoRA  
+from module import (AdaLoraRankAllocator, Concat_LoRA, MoDAdaLoRA, MoDDoRA,
+                    MoDLoRA, adalora_orthogonal_regularization)
 from utils import rouge_score, bleu_score, DataLoader, Batchify, now_time, ids2tokens, unique_sentence_percent, \
     root_mean_square_error, mean_absolute_error, feature_detect, feature_matching_ratio, feature_coverage_ratio, feature_diversity, set_seed
 
@@ -18,10 +19,11 @@ parser.add_argument('-llm_model', '--llm_model', type=str, default="./llm/Qwen2.
                     help='LLM backbone')
 parser.add_argument('-clip_model', '--clip_model', type=str, default="./llm/clip-vit-base-patch32/",
                     help='CLIP model path used to generate item image embeddings')
-parser.add_argument('-model_type', '--model_type', type=str, default="modlora", choices=['modlora', 'lora', 'dora'],
-                    help='model architecture pipeline: multimodal ui/image LoRA or multimodal concat')
-parser.add_argument('-lr', '--lr', type=float, default=1e-7,
-                    help='learning rate for the model')
+parser.add_argument('-model_type', '--model_type', type=str, default="lora",
+                    choices=['modlora', 'moddora', 'modadalora', 'lora', 'dora', 'adalora'],
+                    help='model architecture pipeline: modality-decomposed or multimodal-concat LoRA/DoRA/AdaLoRA')
+parser.add_argument('-lr', '--lr', type=float, default=None,
+                    help='learning rate (default: 2e-7 for LoRA/MoDLoRA, 2e-5 for DoRA/AdaLoRA variants)')
 parser.add_argument('-epochs', '--epochs', type=int, default=1,
                     help='upper epoch limit')
 parser.add_argument('-batch_size', '--batch_size', type=int, default=16,
@@ -44,8 +46,20 @@ parser.add_argument('-mlp_size', '--mlp_size', type=int, default=300,
                     help='hidden size of MLP')
 parser.add_argument('-k', '--k', type=int, default=64, 
                     help='dimensional size of user/item embeddings')
-parser.add_argument('-r', '--r', type=int, default=8, 
-                    help='rank for Textual LoRA')
+parser.add_argument('-r', '--r', type=int, default=None,
+                    help='fixed rank (default: 24 for concat LoRA/DoRA, 8 per MoD branch)')
+parser.add_argument('-adalora_init_r', '--adalora_init_r', type=int, default=None,
+                    help='initial rank (default: 72 for AdaLoRA, 24 per MoDAdaLoRA branch)')
+parser.add_argument('-adalora_target_r', '--adalora_target_r', type=int, default=None,
+                    help='final average rank (default: 24 for AdaLoRA, 8 per MoDAdaLoRA branch)')
+parser.add_argument('-adalora_tinit', '--adalora_tinit', type=int, default=0,
+                    help='AdaLoRA warmup optimizer steps')
+parser.add_argument('-adalora_tfinal', '--adalora_tfinal', type=int, default=0,
+                    help='AdaLoRA final fixed-rank optimizer steps')
+parser.add_argument('-adalora_delta_t', '--adalora_delta_t', type=int, default=1,
+                    help='AdaLoRA rank allocation interval')
+parser.add_argument('-adalora_orth_reg_weight', '--adalora_orth_reg_weight', type=float, default=0.5,
+                    help='AdaLoRA factor orthogonality regularization weight')
 parser.add_argument('-lora_modules', '--lora_modules', type=int, default=7, 
                     help='number of modules for LoRA')
 parser.add_argument('-image_dir', '--image_dir', type=str, default='images',
@@ -61,6 +75,26 @@ parser.add_argument('-acc_steps', '--acc_steps', type=int, default=64,
 parser.add_argument('-seed', '--seed', type=int, default=1111,
                     help='random seed')
 args = parser.parse_args()
+
+if args.lr is None:
+    args.lr = 2e-7 if args.model_type in ('lora', 'modlora') else 2e-5
+if args.r is None:
+    args.r = 24 if args.model_type in ('lora', 'dora', 'adalora') else 8
+if args.adalora_target_r is None:
+    args.adalora_target_r = 24 if args.model_type == 'adalora' else 8
+if args.adalora_init_r is None:
+    args.adalora_init_r = 3 * args.adalora_target_r
+
+is_adalora = args.model_type in ('adalora', 'modadalora')
+if is_adalora:
+    if args.acc_steps <= 0 or args.epochs <= 0:
+        parser.error('AdaLoRA requires positive --acc_steps and --epochs.')
+    if not 0 < args.adalora_target_r < args.adalora_init_r:
+        parser.error('AdaLoRA requires 0 < --adalora_target_r < --adalora_init_r.')
+    if args.adalora_tinit < 0 or args.adalora_tfinal < 0:
+        parser.error('AdaLoRA requires nonnegative warmup and final step counts.')
+    if args.adalora_delta_t <= 0 or args.adalora_orth_reg_weight < 0:
+        parser.error('AdaLoRA requires positive --adalora_delta_t and nonnegative regularization weight.')
 
 if args.data_path is None:
     parser.error('--data_path should be provided for loading data')
@@ -104,7 +138,7 @@ tokenizer.pad_token = pad  # Ensure pad_token is set consistently
 tokenizer.add_special_tokens({'bos_token': bos, 'eos_token': eos, 'pad_token': pad})
 corpus = DataLoader(
     args.data_path, args.index_dir, tokenizer, args.words,
-    clip_path=args.clip_model if args.model_type in ['modlora', 'lora', 'dora'] else None,
+    clip_path=args.clip_model,
     image_dir=args.image_dir,
     device=device
 )
@@ -113,19 +147,25 @@ feature_set = corpus.feature_set
 train_data = Batchify(corpus.train, corpus.user2feature, corpus.item2feature, tokenizer, bos, eos, args.words, args.batch_size, corpus.max_rating, corpus.min_rating, shuffle=True)
 val_data = Batchify(corpus.valid, corpus.user2feature, corpus.item2feature, tokenizer, bos, eos, args.words, args.batch_size, corpus.max_rating, corpus.min_rating)
 test_data = Batchify(corpus.test, corpus.user2feature, corpus.item2feature, tokenizer, bos, eos, args.words, args.batch_size*8, corpus.max_rating, corpus.min_rating)
+total_optimizer_steps = args.epochs * math.ceil(train_data.total_step / args.acc_steps)
+if is_adalora and args.adalora_tinit + args.adalora_tfinal >= total_optimizer_steps:
+    parser.error('AdaLoRA requires more optimizer steps than --adalora_tinit + --adalora_tfinal.')
 
 ###############################################################################
 # Build the model
 ###############################################################################
 
 def build_model():
-    if args.model_type == 'modlora':
-        return MoDLoRA.from_pretrained(
+    adapter_rank = args.adalora_init_r if is_adalora else args.r
+    if args.model_type in ['modlora', 'moddora', 'modadalora']:
+        ModelClass = {'modlora': MoDLoRA, 'moddora': MoDDoRA,
+                      'modadalora': MoDAdaLoRA}[args.model_type]
+        return ModelClass.from_pretrained(
             args.llm_model,
             len(corpus.user_dict),
             len(corpus.item_dict),
             args.k,
-            args.r,
+            adapter_rank,
             args.mlp_size,
             args.lora_modules,
             image_embeddings=corpus.image_embeddings,
@@ -133,17 +173,18 @@ def build_model():
             image_multimodal_scale=args.image_multimodal_scale
         )
 
-    elif args.model_type in ['lora', 'dora']:
+    elif args.model_type in ['lora', 'dora', 'adalora']:
         return Concat_LoRA.from_pretrained(
             args.llm_model,
             len(corpus.user_dict),
             len(corpus.item_dict),
             args.k,
-            args.r,
+            adapter_rank,
             args.mlp_size,
             args.lora_modules,
             image_embeddings=corpus.image_embeddings,
-            is_dora=(args.model_type == 'dora')
+            is_dora=(args.model_type == 'dora'),
+            is_adalora=(args.model_type == 'adalora')
         )
 
     else:
@@ -156,13 +197,17 @@ model.resize_token_embeddings(len(tokenizer))
 model.to(device)
 #optimizer = AdamW(model.parameters(), lr=args.lr)
 optimizer = AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr)
+rank_allocator = (AdaLoraRankAllocator(
+    model, args.adalora_init_r, args.adalora_target_r, total_optimizer_steps,
+    args.adalora_tinit, args.adalora_tfinal, args.adalora_delta_t
+) if is_adalora else None)
 
 ###############################################################################
 # Training code
 ###############################################################################
 import torch.nn.functional as F
 
-def train(train_data):
+def train(train_data, optimizer_step):
     model.train()
     text_loss = 0.
     rating_loss = 0.
@@ -181,7 +226,11 @@ def train(train_data):
             L_r = F.mse_loss(hat_r.to(torch.float32), rating.to(torch.float32))
             loss = outputs.loss + args.rating_reg * L_r
 
-            loss = loss / args.acc_steps
+        if is_adalora and args.adalora_orth_reg_weight:
+            loss = loss + args.adalora_orth_reg_weight * adalora_orthogonal_regularization(model)
+        group_start = ((train_data.step - 1) // args.acc_steps) * args.acc_steps
+        group_size = min(args.acc_steps, train_data.total_step - group_start)
+        loss = loss / group_size
 
         loss.backward()
 
@@ -194,6 +243,9 @@ def train(train_data):
         if accum_count % args.acc_steps == 0 or train_data.step == train_data.total_step:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
             optimizer.step()
+            optimizer_step += 1
+            if rank_allocator is not None:
+                rank_allocator.update_and_allocate(optimizer_step)
             optimizer.zero_grad()
             accum_count = 0
         
@@ -207,6 +259,7 @@ def train(train_data):
             total_sample = 0
         if train_data.step == train_data.total_step:
             break
+    return optimizer_step
 
 def evaluate(data):
     model.eval()
@@ -269,14 +322,14 @@ def generate(data):
             
             generated_ids = generated_output.sequences
 
-            if args.model_type == 'modlora':
-                # MoDLoRA passes input_ids directly into model.generate(),
+            if args.model_type in ['modlora', 'moddora', 'modadalora']:
+                # MoD variants pass input_ids directly into generate(),
                 # so returned sequences contain input tokens + generated tokens.
                 input_size = gen_input_ids.size(1)
                 ids = generated_ids[:, input_size:].tolist()
             
-            elif args.model_type in ['lora', 'dora']:
-                # Concat_LoRA / DoRA use inputs_embeds for multimodal prefixing.
+            elif args.model_type in ['lora', 'dora', 'adalora']:
+                # Concat variants use inputs_embeds for multimodal prefixing.
                 # In the current generation pipeline, returned sequences contain
                 # only newly generated token IDs.
                 ids = generated_ids.tolist()
@@ -290,7 +343,7 @@ def generate(data):
 
             # --- Rating Prediction ---
             # Set multimodal context again as it might be needed for the forward pass
-            if args.model_type == 'modlora':
+            if args.model_type in ['modlora', 'moddora', 'modadalora']:
                 x_ui, x_img = model.build_lora_context(user, item)
                 model.set_Q(x_ui, x_img)
 
@@ -310,11 +363,15 @@ print(now_time() + f'Tuning LLM with LoRA (Architecture: {args.model_type.upper(
 # Loop over epochs.
 best_val_loss = float('inf')
 endure_count = 0
+optimizer_step = 0
 for epoch in range(1, args.epochs + 1):
     print(now_time() + 'epoch {}'.format(epoch))
-    train(train_data)
+    optimizer_step = train(train_data, optimizer_step)
     val_loss = evaluate(val_data)
     print(now_time() + 'text ppl {:4.4f} | valid loss {:4.4f} on validation'.format(math.exp(val_loss), val_loss))
+    if is_adalora and optimizer_step < total_optimizer_steps - args.adalora_tfinal:
+        print(now_time() + 'Waiting for the final AdaLoRA rank budget before checkpoint selection')
+        continue
     # Save the model if the validation loss is the best we've seen so far.
     if val_loss < best_val_loss:
         best_val_loss = val_loss
