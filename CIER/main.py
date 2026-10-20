@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from dataloader import *
 from utils import *
 from model import *
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import AdaLoraConfig, LoraConfig, get_peft_model, TaskType
 from argparse import ArgumentParser
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
@@ -165,13 +165,13 @@ def build_multimodal_image_embeddings(args, item_num, device):
 
 def configure_gradient_checkpointing(model_llm, lora_type):
     model_llm.config.use_cache = False
-    if lora_type == 'modlora':
+    if lora_type in ('modlora', 'moddora', 'modadalora'):
         try:
             model_llm.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
         except TypeError:
-            print("Non-reentrant gradient checkpointing is not supported; disabling it for MoDLoRA.")
+            print(f"Non-reentrant gradient checkpointing is not supported; disabling it for {lora_type}.")
             model_llm.gradient_checkpointing_disable()
     else:
         model_llm.gradient_checkpointing_enable()
@@ -191,16 +191,99 @@ def cleanup_split():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-def train_step(model, 
+def reset_peak_vram_stats(device):
+    """Start a new peak-VRAM measurement window for the selected GPU."""
+    if torch.cuda.is_available():
+        # The model has already initialized this CUDA context before this helper
+        # is called. Using the current device avoids allocator errors seen with
+        # an explicit integer device on some PyTorch/CUDA combinations.
+        with torch.cuda.device(device):
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+
+def log_vram_stats(device, log_name, include_peak=False):
+    """Print CUDA memory usage and append the same information to the run log."""
+    if not torch.cuda.is_available():
+        lines = ["[VRAM Profiling] CUDA is not available; memory profiling skipped."]
+    else:
+        with torch.cuda.device(device):
+            torch.cuda.synchronize()
+            lines = []
+            if include_peak:
+                peak_memory_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                peak_memory_reserved = torch.cuda.max_memory_reserved() / (1024 ** 3)
+                lines.extend([
+                    "=" * 80,
+                    f"[VRAM Profiling] Peak GPU Memory Allocated: {peak_memory_allocated:.2f} GB",
+                    f"[VRAM Profiling] Peak GPU Memory Reserved (Cached): {peak_memory_reserved:.2f} GB",
+                    "=" * 80,
+                ])
+            else:
+                memory_allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+                memory_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                lines.extend([
+                    f"GPU memory allocated: {memory_allocated:.2f} GB",
+                    f"GPU memory cached: {memory_reserved:.2f} GB",
+                ])
+
+    message = "\n".join(lines)
+    print(message)
+    with open(log_name, 'a+', encoding='utf-8') as log_file:
+        log_file.write(message + "\n")
+
+def log_trainable_parameters_summary(model, log_name):
+    """Print and log the model's total and trainable parameter counts."""
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameters = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    trainable_ratio = (
+        100.0 * trainable_parameters / total_parameters if total_parameters else 0.0
+    )
+    lines = [
+        "--- Trainable Parameters Summary (LLM base) ---",
+        f"Total parameters: {total_parameters:,}",
+        f"Trainable parameters (LoRA + Embeddings): {trainable_parameters:,}",
+        f"Trainable ratio: {trainable_ratio:.2f}%",
+    ]
+    message = "\n".join(lines)
+    print(message)
+    with open(log_name, 'a+', encoding='utf-8') as log_file:
+        log_file.write(message + "\n")
+
+def adalora_orthogonal_regularization(model):
+    """Add the AdaLoRA factor regularizer to CIER's externally computed loss."""
+    penalties = []
+    for name, parameter in model.model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if 'lora_A' in name:
+            factor = parameter.float()
+            covariance = factor @ factor.T
+        elif 'lora_B' in name:
+            factor = parameter.float()
+            covariance = factor.T @ factor
+        else:
+            continue
+        identity = torch.eye(covariance.size(0), device=covariance.device)
+        penalties.append(torch.linalg.matrix_norm(covariance - identity))
+    return torch.stack(penalties).mean() if penalties else 0.0
+
+
+def train_step(model,
                train_dataloader,
                optimizer,
                device,
                epoch, 
                show_train_loss_steps,
                accumulation_steps,
-               log_name
+               log_name,
+               global_step=0,
+               rank_update=None,
+               orth_reg_weight=0.0,
                ):
     model.train()
+    optimizer.zero_grad()
     loss_log = []
     for batch_idx, [input_ids, userid, itemid, rating, curr_flag,
                     rating_inputs
@@ -211,19 +294,26 @@ def train_step(model,
         rating = rating.to(device)
         curr_flag = curr_flag.to(device)
         rating_inputs = rating_inputs.to(device)
-        with autocast():
+        with autocast(dtype=torch.bfloat16):
             loss = model.train_step(input_ids, userid, itemid, rating, curr_flag,
                                     rating_inputs
                                    )
+        if orth_reg_weight:
+            loss = loss + orth_reg_weight * adalora_orthogonal_regularization(model)
         loss_log.append(loss.item())
-        loss = loss / accumulation_steps
+        group_start = (batch_idx // accumulation_steps) * accumulation_steps
+        group_size = min(accumulation_steps, len(train_dataloader) - group_start)
+        loss = loss / group_size
         
         loss.backward() 
         
-        if (batch_idx + 1) % accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if (batch_idx + 1) % accumulation_steps == 0 or batch_idx + 1 == len(train_dataloader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step() 
-            model.zero_grad()
+            global_step += 1
+            if rank_update is not None:
+                rank_update(global_step)
+            optimizer.zero_grad()
         
         if (batch_idx + 1) % show_train_loss_steps == 0:
             f = open(log_name,'a+')
@@ -239,7 +329,7 @@ def train_step(model,
                                             round(sum(loss_log)/len(loss_log), 6)))
             f.close()
             loss_log = []
-    return    
+    return global_step
     
 def valid_step(model, valid_dataloader, device, log_name
                ):
@@ -370,6 +460,8 @@ def test_step(model, test_dataloader, device, log_name,
 def main(args):
     if args.lora_type == 'dora' and 'use_dora' not in signature(LoraConfig).parameters:
         raise RuntimeError('DoRA requires peft>=0.9.0; upgrade PEFT before using --lora_type dora.')
+    if args.accumulation_steps <= 0:
+        raise ValueError('--accumulation_steps must be positive.')
     for root_dir in (args.ckpt_dir, args.output_dir, args.log_dir):
         os.makedirs(os.path.join(root_dir, args.dataset_name), exist_ok=True)
     seed_everything(args.seed)
@@ -431,8 +523,9 @@ def main(args):
     for split_index in parse_split_indices(args.split_indices):
         print(f"========== split_index: {split_index} ==========")
         checkpoint_dir = os.path.join(args.ckpt_dir, args.dataset_name)
-        adapter_ckpt_path = os.path.join(checkpoint_dir, f'{split_index}modlora_model.pth')
-        peft_prefix = f'{split_index}dora_' if args.lora_type == 'dora' else split_index
+        adapter_ckpt_path = os.path.join(checkpoint_dir, f'{split_index}{args.lora_type}_model.pth')
+        peft_prefix = (f'{split_index}{args.lora_type}_'
+                       if args.lora_type in ('dora', 'adalora') else split_index)
         peft_adapter_dir = os.path.join(checkpoint_dir, f'{peft_prefix}model')
         prompt_encoder_path = os.path.join(checkpoint_dir, f'{peft_prefix}ped.bin')
         prompt_image_path = os.path.join(checkpoint_dir, f'{peft_prefix}prompt_img.bin')
@@ -447,19 +540,31 @@ def main(args):
         valid_dataloader = DataLoader(valid_set, batch_size=args.batch_size, collate_fn=collate_valid, shuffle=False)
         test_dataloader = DataLoader(test_set, batch_size=args.batch_size, collate_fn=collate_valid, shuffle=False)
 
+        total_step = args.epochs * ((len(train_dataloader) + args.accumulation_steps - 1)
+                                    // args.accumulation_steps)
+        if args.lora_type in ('adalora', 'modadalora') and not args.only_eval:
+            if not 0 < args.adalora_target_r < args.adalora_init_r:
+                raise ValueError('AdaLoRA requires 0 < --adalora_target_r < --adalora_init_r.')
+            if args.adalora_tinit < 0 or args.adalora_tfinal < 0 or args.adalora_tinit + args.adalora_tfinal >= total_step:
+                raise ValueError('AdaLoRA requires total optimizer steps > tinit + tfinal.')
+            if args.adalora_delta_t <= 0 or args.adalora_orth_reg_weight < 0:
+                raise ValueError('AdaLoRA delta_t must be positive and orth_reg_weight nonnegative.')
+
         model_llm = AutoModelForCausalLM.from_pretrained(
                     args.model_name, torch_dtype=torch.bfloat16, device_map='cuda:'+str(device)
         )
         configure_gradient_checkpointing(model_llm, args.lora_type)
 
-        if args.lora_type == 'modlora':
-            model = MoDLoRA(user_num=user_num, 
+        if args.lora_type in ('modlora', 'moddora', 'modadalora'):
+            model_class = {'modlora': MoDLoRA, 'moddora': MoDDoRA,
+                           'modadalora': MoDAdaLoRA}[args.lora_type]
+            model = model_class(user_num=user_num, 
                              item_num=item_num, 
                              hidden=args.id_hidden, 
                              llm_hidden=model_llm.config.hidden_size, 
                              tokenizer=tokenizer, 
                              model_llm=model_llm, 
-                             r=args.r, 
+                             r=args.adalora_init_r if args.lora_type == 'modadalora' else args.r,
                              lora_modules=args.lora_modules,
                              image_embeddings=image_embeddings,
                              ui_multimodal_scale=args.ui_multimodal_scale,
@@ -476,7 +581,20 @@ def main(args):
             )
             if args.lora_type == 'dora':
                 lora_kwargs['use_dora'] = True
-            lora_config = LoraConfig(**lora_kwargs)
+            if args.lora_type == 'adalora':
+                lora_kwargs.pop('r')
+                lora_config = AdaLoraConfig(
+                    **lora_kwargs,
+                    init_r=args.adalora_init_r,
+                    target_r=args.adalora_target_r,
+                    total_step=total_step,
+                    tinit=args.adalora_tinit,
+                    tfinal=args.adalora_tfinal,
+                    deltaT=args.adalora_delta_t,
+                    orth_reg_weight=args.adalora_orth_reg_weight,
+                )
+            else:
+                lora_config = LoraConfig(**lora_kwargs)
             model_llm = get_peft_model(model_llm, lora_config)
             model_llm.print_trainable_parameters()
             model = MyModel(
@@ -495,7 +613,7 @@ def main(args):
         param = list(filter(lambda p: p.requires_grad==True, model.prompt_encoder.parameters()))
         if getattr(model, "f_prompt_img", None) is not None:
             param += list(filter(lambda p: p.requires_grad==True, model.f_prompt_img.parameters()))
-        if args.lora_type == 'modlora':
+        if args.lora_type in ('modlora', 'moddora', 'modadalora'):
             param += list(filter(lambda p: p.requires_grad==True, model.f_ui.parameters()))
             if getattr(model, "f_img", None) is not None:
                 param += list(filter(lambda p: p.requires_grad==True, model.f_img.parameters()))
@@ -505,6 +623,15 @@ def main(args):
              {'params': param, 'lr': args.learning_rate},
              {'params': param2, 'lr': args.learning_rate/10},
         ])
+        rank_update = None
+        if args.lora_type == 'adalora':
+            rank_update = model.model.base_model.update_and_allocate
+        elif args.lora_type == 'modadalora' and not args.only_eval:
+            rank_allocator = MoDAdaLoRARankAllocator(
+                model, args.adalora_init_r, args.adalora_target_r, total_step,
+                args.adalora_tinit, args.adalora_tfinal, args.adalora_delta_t,
+            )
+            rank_update = rank_allocator.update_and_allocate
 
         log_name = os.path.join(args.log_dir, args.dataset_name, f'{args.lora_type}_{args.log_name}')
         output_dir = os.path.join(args.output_dir, args.dataset_name,
@@ -513,16 +640,23 @@ def main(args):
         f.write(args.model_name+"\n")
         f.write("                                 split_index:" +split_index+"\n")
         f.close()
+        log_trainable_parameters_summary(model, log_name)
         best_loss = 999
         early_stop = 1
+        reset_peak_vram_stats(device)
 
+        global_step = 0
         if args.only_eval == False:
             for epoch in range(0, args.epochs):
-                a = train_step(model, train_dataloader,
+                global_step = train_step(model, train_dataloader,
                                optimizer, device,
                                epoch, args.show_train_loss_steps,
                                args.accumulation_steps,
-                               log_name
+                               log_name,
+                               global_step=global_step,
+                               rank_update=rank_update,
+                               orth_reg_weight=(args.adalora_orth_reg_weight
+                                               if args.lora_type in ('adalora', 'modadalora') else 0.0),
                         )
                 collate_train.cur_step = len(train_dataloader)*(epoch+1)
                 valid_loss = valid_step(model, valid_dataloader, device, log_name)
@@ -530,6 +664,11 @@ def main(args):
                 f = open(log_name,'a+')
                 print(valid_loss)
                 f.write(str(valid_loss)+'\n')
+                if (args.lora_type in ('adalora', 'modadalora')
+                        and global_step < total_step - args.adalora_tfinal):
+                    f.write('Waiting for the final AdaLoRA rank budget before checkpoint selection.\n')
+                    f.close()
+                    continue
                 if best_loss<valid_loss:
                     early_stop -= 1
                 else:
@@ -537,7 +676,7 @@ def main(args):
                     f.write("save model\n")
                     best_loss = valid_loss
                     
-                    if args.lora_type == 'modlora':
+                    if args.lora_type in ('modlora', 'moddora', 'modadalora'):
                         trainable_params = {k: v.detach().cpu() for k, v in model.named_parameters() if v.requires_grad}
                         torch.save(trainable_params, adapter_ckpt_path)
                     else:
@@ -552,7 +691,7 @@ def main(args):
                 if early_stop == 0:
                     break
 
-        if args.lora_type == 'modlora':
+        if args.lora_type in ('modlora', 'moddora', 'modadalora'):
             torch.cuda.empty_cache()
             model.load_state_dict(load_adapter_state_dict(adapter_ckpt_path, map_location="cpu"), strict=False)
         else:
@@ -567,7 +706,15 @@ def main(args):
                     print(f"Warning: prompt image projector checkpoint not found: {prompt_image_path}")
             
         test_step(model, test_dataloader, device, log_name, test_set, output_dir, args.word, tokenizer)
-        del model, model_llm, optimizer
+        log_vram_stats(device, log_name, include_peak=True)
+
+        del optimizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log_vram_stats(device, log_name)
+
+        del model, model_llm
         del train_dataloader, valid_dataloader, test_dataloader
         del train_set, valid_set, test_set
         del train_dataset, valid_dataset, test_dataset
@@ -607,11 +754,18 @@ if __name__ == '__main__':
     parser.add_argument('--log_dir', default='./log/', type=str)
     parser.add_argument('--log_name', default='llama.log', type=str)
     parser.add_argument('--output_dir', default='./output/', type=str)
-    parser.add_argument('--lora_type', choices=['lora', 'modlora', 'dora'], default='lora',
-                        help='fine-tuning method: PEFT LoRA, custom MoDLoRA, or PEFT DoRA')
+    parser.add_argument('--lora_type', choices=['lora', 'modlora', 'dora', 'moddora', 'adalora', 'modadalora'], default='lora',
+                        help='fine-tuning method: PEFT LoRA/DoRA/AdaLoRA or custom MoD variants')
     parser.add_argument('--lora_modules', '--lora_modules', type=int, default=2, help='number of modules for LoRA')
     parser.add_argument('--r', '--r', type=int, default=4, help='rank for LoRA')
-    parser.add_argument('--use_multimodal', action='store_true', help='Enable item-image features for CIER/MoDLoRA')
+    parser.add_argument('--adalora_init_r', default=12, type=int, help='initial rank per AdaLoRA branch')
+    parser.add_argument('--adalora_target_r', default=4, type=int, help='final average rank per AdaLoRA branch')
+    parser.add_argument('--adalora_tinit', default=0, type=int, help='AdaLoRA warmup optimizer steps')
+    parser.add_argument('--adalora_tfinal', default=0, type=int, help='AdaLoRA final fixed-rank optimizer steps')
+    parser.add_argument('--adalora_delta_t', default=1, type=int, help='AdaLoRA rank allocation interval')
+    parser.add_argument('--adalora_orth_reg_weight', default=0.5, type=float,
+                        help='AdaLoRA factor orthogonality regularization weight')
+    parser.add_argument('--use_multimodal', action='store_true', help='Enable item-image features for CIER and MoD adapters')
     parser.add_argument('--clip_model', default=None, type=str, help='CLIP model path for generating item image embeddings')
     parser.add_argument('--image_dir', default='images', type=str, help='image folder name under the dataset directory')
     parser.add_argument('--image_embedding_path', default=None, type=str, help='optional precomputed image embedding file')
